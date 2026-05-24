@@ -77,6 +77,51 @@ Open `scanner.py` and edit the constants at the top:
 
 ---
 
+## Deployment — Running 24/7
+
+The scanner runs as an infinite loop, so it needs a machine that stays on. Pick one:
+
+### Option A: Docker (recommended for any cloud or local)
+
+```bash
+cp .env.example .env   # fill in TELEGRAM_TOKEN and TELEGRAM_CHAT_ID
+docker compose up -d   # builds image, starts container, auto-restarts on crash
+docker compose logs -f # tail live logs
+```
+
+### Option B: Cheap VPS — Hetzner CX21 (~$4/mo) or DigitalOcean Droplet (~$6/mo)
+
+```bash
+# On the VPS:
+sudo apt update && sudo apt install -y python3 python3-pip python3-venv git
+
+git clone https://github.com/davestevearch1/binance-short-scanner.git
+cd binance-short-scanner
+
+# Use a virtualenv (required on Ubuntu 23.04+ due to PEP 668):
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+
+cp .env.example .env
+nano .env   # paste your TELEGRAM_TOKEN and TELEGRAM_CHAT_ID
+
+# Install as a systemd service so it survives reboots.
+# Edit User= and paths inside scanner.service if your VPS user is not "ubuntu":
+sudo cp scanner.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable scanner
+sudo systemctl start scanner
+sudo systemctl status scanner   # should show "active (running)"
+```
+
+### Option C: Google Cloud free tier (GCE e2-micro)
+
+Google Cloud offers a permanently free `e2-micro` VM in `us-east1`, `us-west1`, or `us-central1`. Set it up the same way as Option B. See [GCP Always Free docs](https://cloud.google.com/free/docs/free-cloud-features#compute).
+
+> **Why not Firebase?** Firebase Hosting is for static sites and Firebase Functions are serverless (max 9 min per call). Neither can run a persistent Python process. Use Compute Engine or a VPS instead.
+
+---
+
 ## No Binance API key required
 
 The scanner only reads **public** market data — no API key needed. It does **not** place trades.

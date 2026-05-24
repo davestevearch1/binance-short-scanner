@@ -17,7 +17,7 @@ import time
 import logging
 import requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -55,6 +55,47 @@ log = logging.getLogger(__name__)
 
 # Key: "SYMBOL:timeframe" → unix timestamp of last alert
 _alerted: dict[str, float] = {}
+
+# Session-level counters for heartbeat
+_total_scans  = 0
+_total_alerts = 0
+_last_heartbeat: float = 0.0
+HEARTBEAT_INTERVAL_SEC = 3600
+
+
+# ── Smoke test ────────────────────────────────────────────────────────────────
+def smoke_test() -> None:
+    """Verify Binance and Telegram are reachable before entering the main loop."""
+    log.info("Running startup checks...")
+
+    # Binance reachability
+    try:
+        r = requests.get(f"{FUTURES_BASE}/fapi/v1/ticker/price?symbol=BTCUSDT", timeout=10)
+        r.raise_for_status()
+        log.info("Binance API  ✓  (BTC price: %s)", r.json().get("price", "?"))
+    except Exception as e:
+        log.error("Binance API unreachable: %s — cannot run scanner. Check network.", e)
+        raise SystemExit(1)
+
+    # Telegram credentials
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set — alerts will print to console only")
+        return
+
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": "✅ Scanner started — watching Binance perp futures for short setups",
+                "parse_mode": "HTML",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        log.info("Telegram     ✓  (startup message sent)")
+    except Exception as e:
+        log.error("Telegram failed: %s — check TELEGRAM_TOKEN and TELEGRAM_CHAT_ID", e)
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -188,7 +229,7 @@ def check_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> dict |
 
 
 def format_alert(s: dict) -> str:
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     vol_m = s["quote_vol"] / 1_000_000
     return (
         f"🔴 <b>SHORT SETUP — {s['symbol']}</b>  [{s['timeframe']}]\n"
@@ -211,7 +252,8 @@ def format_alert(s: dict) -> str:
 
 
 # ── Scan cycle ────────────────────────────────────────────────────────────────
-def run_scan(tickers: list[dict]) -> None:
+def run_scan(tickers: list[dict]) -> int:
+    """Returns number of alerts sent this cycle."""
     now = time.time()
 
     # Step 1: fast pre-filter using ticker data only (no extra API calls)
@@ -264,10 +306,13 @@ def run_scan(tickers: list[dict]) -> None:
             time.sleep(0.1)  # gentle rate limiting
 
     log.info("Scan complete — %d alert(s) sent", signals)
+    return signals
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
+    global _total_scans, _total_alerts, _last_heartbeat
+
     log.info("=" * 60)
     log.info("Binance Perp Futures Short Scanner")
     log.info("Timeframes : %s", TIMEFRAMES)
@@ -275,16 +320,32 @@ def main() -> None:
              MIN_24H_QUOTE_VOL / 1_000_000, int(MAX_DIST_FROM_HIGH * 100))
     log.info("Signal     : RSI(6) >= %d,  recent pump >= %d%%,  EMA stack,  MACD+",
              RSI6_MIN, int(MIN_RECENT_PUMP * 100))
-    if not TELEGRAM_TOKEN:
-        log.warning("TELEGRAM_TOKEN not set — alerts print to console only")
     log.info("=" * 60)
+
+    smoke_test()
+    _last_heartbeat = time.time()
 
     while True:
         try:
             tickers = fetch_all_tickers()
-            run_scan(tickers)
+            alerts = run_scan(tickers)
+            _total_scans  += 1
+            _total_alerts += alerts
         except Exception as e:
             log.error("Scan cycle error: %s", e)
+
+        # Hourly heartbeat
+        now = time.time()
+        if now - _last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            send_telegram(
+                f"🟢 <b>Scanner alive</b> — [{ts}]\n"
+                f"Scans this session: {_total_scans}\n"
+                f"Alerts sent:        {_total_alerts}\n"
+                f"Next scan in {SCAN_INTERVAL_SEC}s"
+            )
+            _last_heartbeat = now
+
         log.info("Waiting %ds before next scan...", SCAN_INTERVAL_SEC)
         time.sleep(SCAN_INTERVAL_SEC)
 
