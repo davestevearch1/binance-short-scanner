@@ -93,15 +93,20 @@ docker compose logs -f # tail live logs
 
 ```bash
 # On the VPS:
-sudo apt update && sudo apt install -y python3 python3-pip git
+sudo apt update && sudo apt install -y python3 python3-pip python3-venv git
 
 git clone https://github.com/davestevearch1/binance-short-scanner.git
 cd binance-short-scanner
-pip3 install -r requirements.txt
+
+# Use a virtualenv (required on Ubuntu 23.04+ due to PEP 668):
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+
 cp .env.example .env
 nano .env   # paste your TELEGRAM_TOKEN and TELEGRAM_CHAT_ID
 
-# Install as a systemd service so it survives reboots:
+# Install as a systemd service so it survives reboots.
+# Edit User= and paths inside scanner.service if your VPS user is not "ubuntu":
 sudo cp scanner.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable scanner

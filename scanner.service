@@ -1,3 +1,7 @@
+# EDIT THESE to match your VPS:
+#   User=             your VPS user (ubuntu/debian/opc/root)
+#   WorkingDirectory= where you cloned the repo
+#   ExecStart=        path to python inside your venv
 [Unit]
 Description=Binance Short Scanner
 After=network.target
@@ -6,7 +10,7 @@ After=network.target
 User=ubuntu
 WorkingDirectory=/home/ubuntu/binance-short-scanner
 EnvironmentFile=/home/ubuntu/binance-short-scanner/.env
-ExecStart=/usr/bin/python3 /home/ubuntu/binance-short-scanner/scanner.py
+ExecStart=/home/ubuntu/binance-short-scanner/venv/bin/python /home/ubuntu/binance-short-scanner/scanner.py
 Restart=always
 RestartSec=10
 

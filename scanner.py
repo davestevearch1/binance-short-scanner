@@ -17,7 +17,7 @@ import time
 import logging
 import requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -229,7 +229,7 @@ def check_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> dict |
 
 
 def format_alert(s: dict) -> str:
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     vol_m = s["quote_vol"] / 1_000_000
     return (
         f"🔴 <b>SHORT SETUP — {s['symbol']}</b>  [{s['timeframe']}]\n"
@@ -337,7 +337,7 @@ def main() -> None:
         # Hourly heartbeat
         now = time.time()
         if now - _last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
-            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             send_telegram(
                 f"🟢 <b>Scanner alive</b> — [{ts}]\n"
                 f"Scans this session: {_total_scans}\n"
