@@ -24,7 +24,13 @@ load_dotenv()
 
 # ── Telegram credentials (set in .env) ───────────────────────────────────────
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# Admin chat — only this ID can change strategy / pause / resume
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# Everyone who receives alerts (defaults to just the admin)
+TELEGRAM_BROADCAST_IDS = [
+    cid.strip() for cid in os.getenv("TELEGRAM_BROADCAST_IDS", TELEGRAM_CHAT_ID).split(",")
+    if cid.strip()
+]
 
 # ── Binance Futures base URL ──────────────────────────────────────────────────
 FUTURES_BASE = "https://fapi.binance.com"
@@ -32,28 +38,44 @@ FUTURES_BASE = "https://fapi.binance.com"
 # ── Timeframes to scan ────────────────────────────────────────────────────────
 TIMEFRAMES = ["15m", "1h"]
 
-# ── Strategy preset ───────────────────────────────────────────────────────────
-# "v1" = original behaviour (looser, more alerts)
-# "v2" = stricter reversal confirmation (fewer, higher-quality alerts)
-STRATEGY = "v2"
-
 # ── Strategy thresholds (adjust to taste) ────────────────────────────────────
+# These are fixed across all strategy presets.
 MIN_24H_QUOTE_VOL  = 5_000_000  # Only scan coins with >$5M USDT 24h volume (liquidity filter)
 MAX_DIST_FROM_HIGH = 0.05       # Price must be within 5% of 24h high
 MIN_RECENT_PUMP    = 0.05       # Price must have gained >=5% in the last 10 candles (recent pump)
 REQUIRE_EMA_STACK  = True       # EMA7 > EMA25 > EMA99 (stacked bullish = overextended pump)
 REQUIRE_MACD_POS   = True       # MACD histogram must be positive
 
-if STRATEGY == "v1":
-    RSI6_MIN               = 65    # Elevated RSI threshold (original)
-    REQUIRE_MACD_DECLINING = False  # Don't require histogram to be rolling over
-    REQUIRE_RSI_DECLINING  = False  # Don't require RSI to be turning down
-    MIN_UPPER_WICK_RATIO   = 0.0   # No wick filter
-else:  # v2
-    RSI6_MIN               = 70    # Clearly overbought before alerting
-    REQUIRE_MACD_DECLINING = True   # Histogram must be falling (momentum rolling over)
-    REQUIRE_RSI_DECLINING  = True   # RSI(6) must be turning down (peak passed)
-    MIN_UPPER_WICK_RATIO   = 0.35  # Close must be in bottom 65% of candle range
+# ── Strategy preset (live-switchable via Telegram /v1 or /v2) ────────────────
+# "v1" = original behaviour (looser, more alerts)
+# "v2" = stricter reversal confirmation (fewer, higher-quality alerts)
+# Set the default here — change it via Telegram at runtime.
+DEFAULT_STRATEGY = "v2"
+
+# These four globals are set by apply_strategy() below.
+STRATEGY: str
+RSI6_MIN: int
+REQUIRE_MACD_DECLINING: bool
+REQUIRE_RSI_DECLINING: bool
+MIN_UPPER_WICK_RATIO: float
+
+
+def apply_strategy(name: str) -> bool:
+    """Mutate the strategy globals. Returns True if applied, False if name is unknown."""
+    global STRATEGY, RSI6_MIN, REQUIRE_MACD_DECLINING, REQUIRE_RSI_DECLINING, MIN_UPPER_WICK_RATIO
+    name = name.lower()
+    if name == "v1":
+        STRATEGY, RSI6_MIN, REQUIRE_MACD_DECLINING, REQUIRE_RSI_DECLINING, MIN_UPPER_WICK_RATIO = \
+            "v1", 65, False, False, 0.0
+    elif name == "v2":
+        STRATEGY, RSI6_MIN, REQUIRE_MACD_DECLINING, REQUIRE_RSI_DECLINING, MIN_UPPER_WICK_RATIO = \
+            "v2", 70, True, True, 0.35
+    else:
+        return False
+    return True
+
+
+apply_strategy(DEFAULT_STRATEGY)
 
 # ── Scanner behaviour ─────────────────────────────────────────────────────────
 SCAN_INTERVAL_SEC  = 60    # Full scan every 60 seconds
@@ -77,6 +99,11 @@ _total_alerts = 0
 _last_heartbeat: float = 0.0
 HEARTBEAT_INTERVAL_SEC = 3600
 
+# ── Telegram command polling state ────────────────────────────────────────────
+_paused = False
+_telegram_update_offset = 0
+COMMAND_POLL_INTERVAL_SEC = 5
+
 
 # ── Smoke test ────────────────────────────────────────────────────────────────
 def smoke_test() -> None:
@@ -93,40 +120,178 @@ def smoke_test() -> None:
         raise SystemExit(1)
 
     # Telegram credentials
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set — alerts will print to console only")
+    if not TELEGRAM_TOKEN or not TELEGRAM_BROADCAST_IDS:
+        log.warning("TELEGRAM_TOKEN or chat IDs not set — alerts will print to console only")
         return
 
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": "✅ Scanner started — watching Binance perp futures for short setups",
-                "parse_mode": "HTML",
-            },
-            timeout=10,
-        )
-        r.raise_for_status()
-        log.info("Telegram     ✓  (startup message sent)")
-    except Exception as e:
-        log.error("Telegram failed: %s — check TELEGRAM_TOKEN and TELEGRAM_CHAT_ID", e)
+    log.info("Telegram     ✓  (broadcasting to %d chat(s), admin=%s)",
+             len(TELEGRAM_BROADCAST_IDS), TELEGRAM_CHAT_ID or "(none)")
+    send_telegram(
+        f"✅ <b>Scanner started</b> — watching Binance perp futures\n"
+        f"Strategy: <b>{STRATEGY.upper()}</b>\n"
+        f"Send /help for commands"
+    )
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def send_telegram(text: str) -> None:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    """Broadcast a message to every chat ID in TELEGRAM_BROADCAST_IDS."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_BROADCAST_IDS:
         print(f"\n{'─'*60}\n{text}\n{'─'*60}\n")
+        return
+    for cid in TELEGRAM_BROADCAST_IDS:
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": cid, "text": text, "parse_mode": "HTML"},
+                timeout=10,
+            )
+            r.raise_for_status()
+        except Exception as e:
+            log.error("Telegram broadcast to %s failed: %s", cid, e)
+
+
+def send_telegram_reply(chat_id: str | int, text: str) -> None:
+    """Reply to a single chat (for command responses, not broadcasts)."""
+    if not TELEGRAM_TOKEN:
         return
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
             timeout=10,
         )
         r.raise_for_status()
     except Exception as e:
-        log.error("Telegram failed: %s", e)
+        log.error("Telegram reply to %s failed: %s", chat_id, e)
+
+
+# ── Telegram command polling ──────────────────────────────────────────────────
+def format_status() -> str:
+    return (
+        f"🟢 <b>Scanner status</b>\n"
+        f"Strategy: <b>{STRATEGY.upper()}</b>\n"
+        f"State:    {'⏸ Paused' if _paused else '▶ Running'}\n"
+        f"Scans:    {_total_scans}\n"
+        f"Alerts:   {_total_alerts}\n"
+        f"\n"
+        f"Active filters:\n"
+        f"• RSI(6) ≥ {RSI6_MIN}{', declining' if REQUIRE_RSI_DECLINING else ''}\n"
+        f"• MACD histogram positive{', declining' if REQUIRE_MACD_DECLINING else ''}\n"
+        f"• Min upper wick: {int(MIN_UPPER_WICK_RATIO * 100)}%"
+    )
+
+
+def format_help(is_admin: bool) -> str:
+    public = (
+        "<b>Commands</b>\n"
+        "/status — show current scanner state\n"
+        "/help — show this message"
+    )
+    if not is_admin:
+        return public
+    return (
+        public + "\n\n"
+        "<b>Admin commands</b>\n"
+        "/v1 — switch to v1 strategy (looser)\n"
+        "/v2 — switch to v2 strategy (stricter)\n"
+        "/pause — stop scanning (alerts off)\n"
+        "/resume — resume scanning"
+    )
+
+
+def handle_command(text: str, from_id: int, chat_id: int) -> None:
+    """Dispatch a Telegram command. Admin commands silently rejected for others."""
+    global _paused
+    cmd = text.strip().split()[0].lower()
+    is_admin = str(from_id) == str(TELEGRAM_CHAT_ID)
+
+    if cmd in ("/v1", "/v2"):
+        if not is_admin:
+            send_telegram_reply(chat_id, "⛔ Only the admin can change strategy.")
+            return
+        target = cmd[1:]
+        if STRATEGY == target:
+            send_telegram_reply(chat_id, f"ℹ️ Already on <b>{target.upper()}</b>.")
+            return
+        apply_strategy(target)
+        log.info("Strategy switched to %s via Telegram by admin", target.upper())
+        send_telegram(f"⚙️ <b>Strategy switched to {target.upper()}</b> by admin")
+
+    elif cmd == "/status":
+        send_telegram_reply(chat_id, format_status())
+
+    elif cmd == "/pause":
+        if not is_admin:
+            send_telegram_reply(chat_id, "⛔ Only the admin can pause the scanner.")
+            return
+        if _paused:
+            send_telegram_reply(chat_id, "ℹ️ Already paused.")
+            return
+        _paused = True
+        log.info("Scanner paused via Telegram by admin")
+        send_telegram("⏸ <b>Scanner paused</b> by admin")
+
+    elif cmd == "/resume":
+        if not is_admin:
+            send_telegram_reply(chat_id, "⛔ Only the admin can resume the scanner.")
+            return
+        if not _paused:
+            send_telegram_reply(chat_id, "ℹ️ Already running.")
+            return
+        _paused = False
+        log.info("Scanner resumed via Telegram by admin")
+        send_telegram("▶ <b>Scanner resumed</b> by admin")
+
+    elif cmd == "/help":
+        send_telegram_reply(chat_id, format_help(is_admin))
+
+
+def drain_telegram_updates() -> None:
+    """Advance offset past any pending updates so messages sent before startup are ignored."""
+    global _telegram_update_offset
+    if not TELEGRAM_TOKEN:
+        return
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            params={"timeout": 0},
+            timeout=10,
+        )
+        r.raise_for_status()
+        updates = r.json().get("result", [])
+        if updates:
+            _telegram_update_offset = updates[-1]["update_id"] + 1
+            log.info("Drained %d stale Telegram update(s) on startup", len(updates))
+    except Exception as e:
+        log.debug("Telegram drain error: %s", e)
+
+
+def poll_telegram_commands() -> None:
+    """Fetch new Telegram messages and dispatch any commands from allowed users."""
+    global _telegram_update_offset
+    if not TELEGRAM_TOKEN:
+        return
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            params={"offset": _telegram_update_offset, "timeout": 0},
+            timeout=10,
+        )
+        r.raise_for_status()
+        for update in r.json().get("result", []):
+            _telegram_update_offset = max(_telegram_update_offset, update["update_id"] + 1)
+            msg = update.get("message") or update.get("edited_message")
+            if not msg or "text" not in msg:
+                continue
+            from_id = msg["from"]["id"]
+            chat_id = msg["chat"]["id"]
+            # Allowlist: must be in broadcast list OR the admin
+            if str(from_id) not in TELEGRAM_BROADCAST_IDS and str(from_id) != str(TELEGRAM_CHAT_ID):
+                continue
+            handle_command(msg["text"], from_id, chat_id)
+    except Exception as e:
+        log.debug("Telegram poll error: %s", e)
 
 
 # ── Binance API ───────────────────────────────────────────────────────────────
@@ -362,15 +527,19 @@ def main() -> None:
 
     smoke_test()
     _last_heartbeat = time.time()
+    drain_telegram_updates()  # skip any backlog from before startup
 
     while True:
-        try:
-            tickers = fetch_all_tickers()
-            alerts = run_scan(tickers)
-            _total_scans  += 1
-            _total_alerts += alerts
-        except Exception as e:
-            log.error("Scan cycle error: %s", e)
+        if _paused:
+            log.info("Scanner paused — skipping scan cycle")
+        else:
+            try:
+                tickers = fetch_all_tickers()
+                alerts = run_scan(tickers)
+                _total_scans  += 1
+                _total_alerts += alerts
+            except Exception as e:
+                log.error("Scan cycle error: %s", e)
 
         # Hourly heartbeat
         now = time.time()
@@ -378,14 +547,19 @@ def main() -> None:
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             send_telegram(
                 f"🟢 <b>Scanner alive</b> — [{ts}]\n"
+                f"Strategy:           <b>{STRATEGY.upper()}</b>\n"
                 f"Scans this session: {_total_scans}\n"
                 f"Alerts sent:        {_total_alerts}\n"
                 f"Next scan in {SCAN_INTERVAL_SEC}s"
             )
             _last_heartbeat = now
 
-        log.info("Waiting %ds before next scan...", SCAN_INTERVAL_SEC)
-        time.sleep(SCAN_INTERVAL_SEC)
+        # Poll Telegram for commands every COMMAND_POLL_INTERVAL_SEC until next scan
+        log.info("Waiting %ds before next scan (polling for commands)...", SCAN_INTERVAL_SEC)
+        deadline = time.time() + SCAN_INTERVAL_SEC
+        while time.time() < deadline:
+            poll_telegram_commands()
+            time.sleep(min(COMMAND_POLL_INTERVAL_SEC, max(0.1, deadline - time.time())))
 
 
 if __name__ == "__main__":
