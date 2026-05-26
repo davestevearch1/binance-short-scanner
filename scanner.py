@@ -32,13 +32,28 @@ FUTURES_BASE = "https://fapi.binance.com"
 # ── Timeframes to scan ────────────────────────────────────────────────────────
 TIMEFRAMES = ["15m", "1h"]
 
+# ── Strategy preset ───────────────────────────────────────────────────────────
+# "v1" = original behaviour (looser, more alerts)
+# "v2" = stricter reversal confirmation (fewer, higher-quality alerts)
+STRATEGY = "v2"
+
 # ── Strategy thresholds (adjust to taste) ────────────────────────────────────
 MIN_24H_QUOTE_VOL  = 5_000_000  # Only scan coins with >$5M USDT 24h volume (liquidity filter)
 MAX_DIST_FROM_HIGH = 0.05       # Price must be within 5% of 24h high
 MIN_RECENT_PUMP    = 0.05       # Price must have gained >=5% in the last 10 candles (recent pump)
-RSI6_MIN           = 65         # RSI(6) must be >= this (65=elevated, 75=clearly overbought)
 REQUIRE_EMA_STACK  = True       # EMA7 > EMA25 > EMA99 (stacked bullish = overextended pump)
 REQUIRE_MACD_POS   = True       # MACD histogram must be positive
+
+if STRATEGY == "v1":
+    RSI6_MIN               = 65    # Elevated RSI threshold (original)
+    REQUIRE_MACD_DECLINING = False  # Don't require histogram to be rolling over
+    REQUIRE_RSI_DECLINING  = False  # Don't require RSI to be turning down
+    MIN_UPPER_WICK_RATIO   = 0.0   # No wick filter
+else:  # v2
+    RSI6_MIN               = 70    # Clearly overbought before alerting
+    REQUIRE_MACD_DECLINING = True   # Histogram must be falling (momentum rolling over)
+    REQUIRE_RSI_DECLINING  = True   # RSI(6) must be turning down (peak passed)
+    MIN_UPPER_WICK_RATIO   = 0.35  # Close must be in bottom 65% of candle range
 
 # ── Scanner behaviour ─────────────────────────────────────────────────────────
 SCAN_INTERVAL_SEC  = 60    # Full scan every 60 seconds
@@ -179,17 +194,23 @@ def check_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> dict |
 
     # Use last CLOSED candle (index -2) — avoids false signals on live forming candle
     i = -2
-    price  = c.iloc[i]
-    e7     = _e7.iloc[i]
-    e25    = _e25.iloc[i]
-    e99    = _e99.iloc[i]
-    r6     = _r6.iloc[i]
-    r12    = _r12.iloc[i]
-    r24    = _r24.iloc[i]
-    mh     = _mh.iloc[i]
-    high24 = float(ticker["highPrice"])
+    price    = c.iloc[i]
+    e7       = _e7.iloc[i]
+    e25      = _e25.iloc[i]
+    e99      = _e99.iloc[i]
+    r6       = _r6.iloc[i]
+    r6_prev  = _r6.iloc[i - 1]
+    r12      = _r12.iloc[i]
+    r24      = _r24.iloc[i]
+    mh       = _mh.iloc[i]
+    mh_prev  = _mh.iloc[i - 1]
+    high24   = float(ticker["highPrice"])
 
     if r6 < RSI6_MIN:
+        return None
+
+    # RSI(6) must be turning down — peak has passed
+    if REQUIRE_RSI_DECLINING and r6 >= r6_prev:
         return None
 
     dist_pct = (high24 - price) / high24
@@ -209,6 +230,18 @@ def check_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> dict |
     if REQUIRE_MACD_POS and mh <= 0:
         return None
 
+    # MACD histogram must be declining — momentum rolling over, not still accelerating
+    if REQUIRE_MACD_DECLINING and mh >= mh_prev:
+        return None
+
+    # Upper wick filter — close must be in lower portion of candle range (rejection candle)
+    candle_high  = df["high"].iloc[i]
+    candle_low   = df["low"].iloc[i]
+    candle_range = candle_high - candle_low
+    wick_ratio   = (candle_high - price) / candle_range if candle_range > 0 else 0.0
+    if wick_ratio < MIN_UPPER_WICK_RATIO:
+        return None
+
     return {
         "symbol":      symbol,
         "timeframe":   tf,
@@ -225,6 +258,7 @@ def check_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> dict |
         "ema25":       round(e25, 8),
         "ema99":       round(e99, 8),
         "macd_hist":   round(mh, 8),
+        "wick_ratio":  round(wick_ratio * 100, 1),
     }
 
 
@@ -245,6 +279,7 @@ def format_alert(s: dict) -> str:
         f"EMA25:   {s['ema25']}\n"
         f"EMA99:   {s['ema99']}\n"
         f"MACD:    {s['macd_hist']}\n"
+        f"Wick:    {s['wick_ratio']}%  (top {s['wick_ratio']}% of candle rejected)\n"
         f"\n"
         f"⚠️ Coin is pumping, near 24h high, EMAs stacked — potential retrace incoming\n"
         f"Consider SHORT entry"
@@ -295,8 +330,8 @@ def run_scan(tickers: list[dict]) -> int:
                 sig = check_signal(df, ticker, symbol, tf)
                 if sig:
                     log.info(
-                        "SIGNAL  %-15s [%3s]  RSI6=%-5.1f  pump=+%.1f%%  %.2f%% from high",
-                        symbol, tf, sig["rsi6"], sig["recent_pump"], sig["dist_pct"],
+                        "SIGNAL  %-15s [%3s]  RSI6=%-5.1f  pump=+%.1f%%  %.2f%% from high  wick=%.0f%%",
+                        symbol, tf, sig["rsi6"], sig["recent_pump"], sig["dist_pct"], sig["wick_ratio"],
                     )
                     send_telegram(format_alert(sig))
                     _alerted[key] = now
@@ -318,8 +353,11 @@ def main() -> None:
     log.info("Timeframes : %s", TIMEFRAMES)
     log.info("Filter     : 24h vol > $%.1fM,  within %d%% of 24h high",
              MIN_24H_QUOTE_VOL / 1_000_000, int(MAX_DIST_FROM_HIGH * 100))
+    log.info("Strategy   : %s", STRATEGY)
     log.info("Signal     : RSI(6) >= %d,  recent pump >= %d%%,  EMA stack,  MACD+",
              RSI6_MIN, int(MIN_RECENT_PUMP * 100))
+    log.info("           : MACD declining=%s,  RSI declining=%s,  min wick=%.0f%%",
+             REQUIRE_MACD_DECLINING, REQUIRE_RSI_DECLINING, MIN_UPPER_WICK_RATIO * 100)
     log.info("=" * 60)
 
     smoke_test()
