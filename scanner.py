@@ -279,7 +279,7 @@ def format_alert(s: dict) -> str:
         f"EMA25:   {s['ema25']}\n"
         f"EMA99:   {s['ema99']}\n"
         f"MACD:    {s['macd_hist']}\n"
-        f"Wick:    {s['wick_ratio']}%  (top {s['wick_ratio']}% of candle rejected)\n"
+        f"Wick:    {s['wick_ratio']}%  of candle range rejected by sellers\n"
         f"\n"
         f"⚠️ Coin is pumping, near 24h high, EMAs stacked — potential retrace incoming\n"
         f"Consider SHORT entry"
