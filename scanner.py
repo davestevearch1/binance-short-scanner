@@ -75,7 +75,8 @@ def apply_strategy(name: str) -> bool:
     return True
 
 
-apply_strategy(DEFAULT_STRATEGY)
+if not apply_strategy(DEFAULT_STRATEGY):
+    raise SystemExit(f"Invalid DEFAULT_STRATEGY {DEFAULT_STRATEGY!r} — must be 'v1' or 'v2'")
 
 # ── Scanner behaviour ─────────────────────────────────────────────────────────
 SCAN_INTERVAL_SEC  = 60    # Full scan every 60 seconds
@@ -203,7 +204,10 @@ def format_help(is_admin: bool) -> str:
 def handle_command(text: str, from_id: int, chat_id: int) -> None:
     """Dispatch a Telegram command. Admin commands silently rejected for others."""
     global _paused
-    cmd = text.strip().split()[0].lower()
+    parts = text.strip().split()
+    if not parts:
+        return
+    cmd = parts[0].lower()
     is_admin = str(from_id) == str(TELEGRAM_CHAT_ID)
 
     if cmd in ("/v1", "/v2"):
