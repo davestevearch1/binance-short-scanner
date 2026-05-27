@@ -294,25 +294,28 @@ def handle_command(text: str, from_id: int, chat_id: int) -> None:
     if not parts:
         return
     cmd = parts[0].lower()
+    if not cmd.startswith("/"):
+        return  # not a command — ignore regular chat messages
+    # Strip leading slash and any "@BotName" suffix used in group chats
+    cmd_root = cmd[1:].split("@", 1)[0]
     is_admin = str(from_id) == str(TELEGRAM_CHAT_ID)
 
-    # Mode-switching commands — check against VALID_MODES (case-insensitive)
-    if cmd.lstrip("/") in VALID_MODES:
+    # Mode-switching commands (case-insensitive)
+    if cmd_root in VALID_MODES:
         if not is_admin:
             send_telegram_reply(chat_id, "⛔ Only the admin can change mode.")
             return
-        target = cmd.lstrip("/")
-        if target == MODE.lower():
+        if cmd_root == MODE.lower():
             send_telegram_reply(chat_id, f"ℹ️ Already on <b>{MODE}</b>.")
             return
-        apply_mode(target)
+        apply_mode(cmd_root)
         log.info("Mode switched to %s via Telegram by admin", MODE)
         send_telegram(f"⚙️ <b>Mode switched to {MODE}</b> by admin")
 
-    elif cmd == "/status":
+    elif cmd_root == "status":
         send_telegram_reply(chat_id, format_status())
 
-    elif cmd == "/pause":
+    elif cmd_root == "pause":
         if not is_admin:
             send_telegram_reply(chat_id, "⛔ Only the admin can pause the scanner.")
             return
@@ -323,7 +326,7 @@ def handle_command(text: str, from_id: int, chat_id: int) -> None:
         log.info("Scanner paused via Telegram by admin")
         send_telegram("⏸ <b>Scanner paused</b> by admin")
 
-    elif cmd == "/resume":
+    elif cmd_root == "resume":
         if not is_admin:
             send_telegram_reply(chat_id, "⛔ Only the admin can resume the scanner.")
             return
@@ -334,7 +337,7 @@ def handle_command(text: str, from_id: int, chat_id: int) -> None:
         log.info("Scanner resumed via Telegram by admin")
         send_telegram("▶ <b>Scanner resumed</b> by admin")
 
-    elif cmd == "/help":
+    elif cmd_root == "help":
         send_telegram_reply(chat_id, format_help(is_admin))
 
 
