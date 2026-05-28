@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-Binance Futures Short & Long Scanner
---------------------------------------
-Automates finding short (fade exhausted pump) and long (fade exhausted dump) setups:
-  1. Fetches all USDT perp futures tickers
-  2. Pre-filters to liquid coins near their 24h high or low
-  3. Runs EMA(7/25/99), RSI(6/12/24), MACD on 15m and 1h charts
-  4. Sends a Telegram alert when a setup matches — includes a stop suggestion
+Binance Futures Short, Long & Breakout Scanner
+-----------------------------------------------
+Three setup types in one scanner:
+  - Shorts (🔴):   fade an exhausted pump near the 24h high
+  - Bounce-longs (🟢): fade an exhausted dump (hammer) near the 24h low
+  - Breakouts (🚀): catch a confirmed momentum shift to the upside (above EMA25,
+                    rising RSI, volume conviction, 24h change +5–25%)
+
+Each alert includes a stop suggestion based on the trigger level
+(24h high for shorts, 24h low for bounces, EMA25 for breakouts).
 
 Modes (admin-switchable from Telegram):
   /v1      — shorts only, loose conditions
   /v2      — shorts only, strict  (default)
-  /long    — longs only, strict
-  /v1Both  — both sides, loose
-  /v2Both  — both sides, strict
+  /long    — bounce-longs + breakouts (longs only), strict
+  /v1Both  — shorts + bounce-longs + breakouts, loose
+  /v2Both  — shorts + bounce-longs + breakouts, strict
 
 Setup: copy .env.example to .env and fill in your Telegram credentials.
 Run:   python scanner.py
@@ -56,8 +59,15 @@ REQUIRE_EMA_BEAR   = True       # Long:  EMA7 < EMA25 < EMA99 (bearish stack)
 REQUIRE_MACD_POS   = True       # Short: MACD histogram must be positive
 REQUIRE_MACD_NEG   = True       # Long:  MACD histogram must be negative
 KNIFE_MAX_DROP     = 0.20       # Long:  skip coins down >20% on the day
-MIN_VOL_MULTIPLIER = 1.5        # Long:  candle volume >= 1.5x 20-candle average
-STOP_BUFFER_PCT    = 0.005      # 0.5% buffer past the 24h level for stop suggestion
+MIN_VOL_MULTIPLIER = 1.5        # Long/Breakout: candle volume >= 1.5x 20-candle average
+STOP_BUFFER_PCT    = 0.005      # 0.5% buffer past the trigger level for stop suggestion
+
+# Breakout-long (momentum trade) fixed thresholds
+BREAKOUT_MIN_DAILY       = 5.0   # Breakout pre-filter: 24h change >= +5%
+BREAKOUT_MAX_DAILY       = 25.0  # Breakout pre-filter: 24h change <= +25% (skip exhausted runners)
+BREAKOUT_MIN_RECENT_PUMP = 0.03  # Breakout: price up >=3% in last 10 candles on this TF
+BREAKOUT_RSI_MAX         = 70    # Breakout: RSI(6) must be < 70 (else short scanner zone)
+MAX_BREAKOUT_STOP_PCT    = 5.0   # Breakout: skip if stop would be >5% wide (bad R:R)
 
 # ── Mode preset (live-switchable via Telegram) ────────────────────────────────
 # Restart reverts to DEFAULT_MODE.
@@ -68,6 +78,7 @@ VALID_MODES  = ("v1", "v2", "long", "v1both", "v2both")  # matched lowercased
 MODE:                   str
 SHORTS_ENABLED:         bool
 LONGS_ENABLED:          bool
+BREAKOUTS_ENABLED:      bool
 # Short-side thresholds
 RSI6_MIN:               int
 REQUIRE_MACD_DECLINING: bool
@@ -78,6 +89,10 @@ RSI6_MAX:               int
 REQUIRE_MACD_RISING:    bool
 REQUIRE_RSI_RISING:     bool
 MIN_LOWER_WICK_RATIO:   float
+# Breakout-side thresholds (mode-controlled v1/v2 toggles)
+BREAKOUT_RSI_MIN:               int
+REQUIRE_BREAKOUT_FULL_STACK:    bool
+REQUIRE_BREAKOUT_MACD_RISING:   bool
 
 # Canonical display names (preserves v1Both / v2Both capitalisation)
 _MODE_DISPLAY = {
@@ -109,36 +124,46 @@ def _apply_long_strategy(name: str) -> None:
             25, True, True, 0.35
 
 
+def _apply_breakout_strategy(name: str) -> None:
+    global BREAKOUT_RSI_MIN, REQUIRE_BREAKOUT_FULL_STACK, REQUIRE_BREAKOUT_MACD_RISING
+    if name == "v1":
+        BREAKOUT_RSI_MIN, REQUIRE_BREAKOUT_FULL_STACK, REQUIRE_BREAKOUT_MACD_RISING = \
+            50, False, False
+    else:  # v2
+        BREAKOUT_RSI_MIN, REQUIRE_BREAKOUT_FULL_STACK, REQUIRE_BREAKOUT_MACD_RISING = \
+            60, True, True
+
+
 def apply_mode(mode: str) -> bool:
     """
     Switch scanner mode. Case-insensitive. Returns True if applied, False if unknown.
     Mapping:
-      v1     → shorts v1, longs off
-      v2     → shorts v2, longs off
-      long   → shorts off, longs v2
-      v1both → shorts v1, longs v1
-      v2both → shorts v2, longs v2
+      v1     → shorts v1, longs off,   breakouts off
+      v2     → shorts v2, longs off,   breakouts off
+      long   → shorts off, longs v2,   breakouts v2
+      v1both → shorts v1, longs v1,    breakouts v1
+      v2both → shorts v2, longs v2,    breakouts v2
     """
-    global MODE, SHORTS_ENABLED, LONGS_ENABLED
+    global MODE, SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED
     key = mode.strip().lower()
     if key not in VALID_MODES:
         return False
     MODE = _MODE_DISPLAY[key]
     if key == "v1":
-        SHORTS_ENABLED, LONGS_ENABLED = True, False
-        _apply_short_strategy("v1");  _apply_long_strategy("v2")
+        SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED = True,  False, False
+        _apply_short_strategy("v1");  _apply_long_strategy("v2");  _apply_breakout_strategy("v2")
     elif key == "v2":
-        SHORTS_ENABLED, LONGS_ENABLED = True, False
-        _apply_short_strategy("v2");  _apply_long_strategy("v2")
+        SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED = True,  False, False
+        _apply_short_strategy("v2");  _apply_long_strategy("v2");  _apply_breakout_strategy("v2")
     elif key == "long":
-        SHORTS_ENABLED, LONGS_ENABLED = False, True
-        _apply_short_strategy("v2");  _apply_long_strategy("v2")
+        SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED = False, True,  True
+        _apply_short_strategy("v2");  _apply_long_strategy("v2");  _apply_breakout_strategy("v2")
     elif key == "v1both":
-        SHORTS_ENABLED, LONGS_ENABLED = True, True
-        _apply_short_strategy("v1");  _apply_long_strategy("v1")
+        SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED = True,  True,  True
+        _apply_short_strategy("v1");  _apply_long_strategy("v1");  _apply_breakout_strategy("v1")
     elif key == "v2both":
-        SHORTS_ENABLED, LONGS_ENABLED = True, True
-        _apply_short_strategy("v2");  _apply_long_strategy("v2")
+        SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED = True,  True,  True
+        _apply_short_strategy("v2");  _apply_long_strategy("v2");  _apply_breakout_strategy("v2")
     return True
 
 
@@ -158,7 +183,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Key: "SYMBOL:timeframe:direction" → unix timestamp of last alert (direction = short|long)
+# Key: "SYMBOL:timeframe:direction" → unix timestamp of last alert (direction = short|long|breakout)
 _alerted: dict[str, float] = {}
 
 # Session-level counters for heartbeat
@@ -194,9 +219,11 @@ def smoke_test() -> None:
              len(TELEGRAM_BROADCAST_IDS), TELEGRAM_CHAT_ID or "(none)")
     sides = []
     if SHORTS_ENABLED:
-        sides.append(f"shorts")
+        sides.append("shorts")
     if LONGS_ENABLED:
-        sides.append(f"longs")
+        sides.append("bounce-longs")
+    if BREAKOUTS_ENABLED:
+        sides.append("breakouts")
     send_telegram(
         f"✅ <b>Scanner started</b> — watching Binance perp futures\n"
         f"Mode: <b>{MODE}</b>  ({'  +  '.join(sides)})\n"
@@ -252,6 +279,13 @@ def format_status() -> str:
         f"  Vol ≥ {MIN_VOL_MULTIPLIER}×  |  knife filter: −{int(KNIFE_MAX_DROP*100)}%"
     ) if LONGS_ENABLED else "  (off)"
 
+    breakout_info = (
+        f"  Price > EMA25  |  EMA7 > EMA25{' > EMA99' if REQUIRE_BREAKOUT_FULL_STACK else ''}\n"
+        f"  RSI(6) {BREAKOUT_RSI_MIN}–{BREAKOUT_RSI_MAX}, rising\n"
+        f"  MACD > 0{', rising' if REQUIRE_BREAKOUT_MACD_RISING else ''}\n"
+        f"  Vol ≥ {MIN_VOL_MULTIPLIER}×  |  24h change {BREAKOUT_MIN_DAILY:.0f}–{BREAKOUT_MAX_DAILY:.0f}%"
+    ) if BREAKOUTS_ENABLED else "  (off)"
+
     return (
         f"🟢 <b>Scanner status</b>\n"
         f"Mode:   <b>{MODE}</b>\n"
@@ -260,7 +294,9 @@ def format_status() -> str:
         f"\n"
         f"📉 <b>Shorts</b>\n{short_info}\n"
         f"\n"
-        f"📈 <b>Longs</b>\n{long_info}"
+        f"📈 <b>Bounce-Longs</b>\n{long_info}\n"
+        f"\n"
+        f"🚀 <b>Breakouts</b>\n{breakout_info}"
     )
 
 
@@ -277,9 +313,9 @@ def format_help(is_admin: bool) -> str:
         "<b>Admin — mode commands</b>\n"
         "/v1     — shorts only, loose conditions\n"
         "/v2     — shorts only, strict  (default)\n"
-        "/long   — longs only, strict\n"
-        "/v1Both — both sides, loose\n"
-        "/v2Both — both sides, strict\n"
+        "/long   — bounce-longs + breakouts (longs only), strict\n"
+        "/v1Both — shorts + bounce-longs + breakouts, loose\n"
+        "/v2Both — shorts + bounce-longs + breakouts, strict\n"
         "\n"
         "<b>Admin — controls</b>\n"
         "/pause  — stop scanning (alerts off)\n"
@@ -627,6 +663,87 @@ def check_long_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> d
     }
 
 
+def check_breakout_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> dict | None:
+    """
+    Returns a breakout-long signal dict when the coin matches a momentum setup, else None.
+
+    Fixed conditions (always required):
+      1. 24h change in [BREAKOUT_MIN_DAILY, BREAKOUT_MAX_DAILY] — meaningful but not exhausted
+      2. Price > EMA25                                 — above the trend trigger
+      3. EMA7 > EMA25                                  — fast EMA momentum positive
+      4. MACD histogram > 0                            — momentum confirmed
+      5. RSI(6) in [BREAKOUT_RSI_MIN, BREAKOUT_RSI_MAX) and rising
+                                                       — buyers in control, not yet overbought
+      6. Candle volume >= MIN_VOL_MULTIPLIER × 20c avg — real conviction
+      7. Recent pump >= BREAKOUT_MIN_RECENT_PUMP       — breakout fresh on this TF
+      8. Stop distance <= MAX_BREAKOUT_STOP_PCT         — skip late/wide-stop entries
+
+    Variable conditions (v1 loose / v2 strict):
+      9. EMA stack full bullish (EMA7>EMA25>EMA99)    — required in v2
+     10. MACD histogram rising                        — required in v2
+     11. RSI(6) >= 60 (instead of just >=50)          — enforced via BREAKOUT_RSI_MIN
+    """
+    ind      = compute_indicators(df)
+    c        = df["close"]
+    price    = ind["price"]
+    change24 = float(ticker["priceChangePercent"])
+
+    # Pre-filter conditions repeated here for safety (main pre-filter in run_scan)
+    if not (BREAKOUT_MIN_DAILY <= change24 <= BREAKOUT_MAX_DAILY):
+        return None
+
+    # Fixed conditions
+    if price <= ind["e25"]:
+        return None
+    if ind["e7"] <= ind["e25"]:
+        return None
+    if REQUIRE_BREAKOUT_FULL_STACK and not (ind["e7"] > ind["e25"] > ind["e99"]):
+        return None
+    if ind["mh"] <= 0:
+        return None
+    if REQUIRE_BREAKOUT_MACD_RISING and ind["mh"] <= ind["mh_prev"]:
+        return None
+    if not (BREAKOUT_RSI_MIN <= ind["r6"] < BREAKOUT_RSI_MAX):
+        return None
+    if ind["r6"] <= ind["r6_prev"]:
+        return None
+    if ind["avg_vol_20"] > 0 and ind["candle_vol"] < MIN_VOL_MULTIPLIER * ind["avg_vol_20"]:
+        return None
+
+    lookback    = min(10, len(c) - 2)
+    past_price  = c.iloc[-2 - lookback]
+    recent_pump = (price - past_price) / past_price if past_price > 0 else 0
+    if recent_pump < BREAKOUT_MIN_RECENT_PUMP:
+        return None
+
+    stop_price = ind["e25"] * (1 - STOP_BUFFER_PCT)
+    stop_pct   = (price - stop_price) / price * 100
+    if stop_pct > MAX_BREAKOUT_STOP_PCT:
+        return None
+
+    vol_mult = ind["candle_vol"] / ind["avg_vol_20"] if ind["avg_vol_20"] > 0 else 0.0
+
+    return {
+        "direction":   "breakout",
+        "symbol":      symbol,
+        "timeframe":   tf,
+        "price":       price,
+        "change24":    change24,
+        "quote_vol":   float(ticker["quoteVolume"]),
+        "recent_move": round(recent_pump * 100, 2),
+        "rsi6":        round(ind["r6"], 2),
+        "rsi12":       round(ind["r12"], 2),
+        "rsi24":       round(ind["r24"], 2),
+        "ema7":        round(ind["e7"], 8),
+        "ema25":       round(ind["e25"], 8),
+        "ema99":       round(ind["e99"], 8),
+        "macd_hist":   round(ind["mh"], 8),
+        "vol_mult":    round(vol_mult, 2),
+        "stop_price":  round(stop_price, 8),
+        "stop_pct":    round(stop_pct, 2),
+    }
+
+
 # ── Alert formatters ──────────────────────────────────────────────────────────
 def format_short_alert(s: dict) -> str:
     ts    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -681,8 +798,37 @@ def format_long_alert(s: dict) -> str:
     )
 
 
+def format_breakout_alert(s: dict) -> str:
+    ts    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    vol_m = s["quote_vol"] / 1_000_000
+    return (
+        f"🚀 <b>BREAKOUT LONG — {s['symbol']}</b>  [{s['timeframe']}]  mode:{MODE}\n"
+        f"{ts}\n"
+        f"\n"
+        f"Price:       <b>{s['price']}</b>\n"
+        f"24h Change:  +{s['change24']:.2f}%   |  24h Vol: ${vol_m:.1f}M\n"
+        f"Recent pump: +{s['recent_move']}%  (last 10 candles on {s['timeframe']})\n"
+        f"\n"
+        f"RSI(6):  <b>{s['rsi6']}</b>  |  RSI(12): {s['rsi12']}  |  RSI(24): {s['rsi24']}\n"
+        f"EMA7:    {s['ema7']}\n"
+        f"EMA25:   {s['ema25']}  ← stop trigger\n"
+        f"EMA99:   {s['ema99']}\n"
+        f"MACD:    {s['macd_hist']}\n"
+        f"Volume:  {s['vol_mult']}×  20-candle average\n"
+        f"\n"
+        f"🛑 Stop suggestion: below {s['stop_price']}  (-{s['stop_pct']:.2f}% from entry)\n"
+        f"\n"
+        f"⚠️ Momentum shift confirmed: above EMA25, rising RSI, volume conviction\n"
+        f"Consider LONG entry (breakout — momentum trade, not bounce trade)"
+    )
+
+
 def format_alert(s: dict) -> str:
-    return format_long_alert(s) if s["direction"] == "long" else format_short_alert(s)
+    if s["direction"] == "breakout":
+        return format_breakout_alert(s)
+    if s["direction"] == "long":
+        return format_long_alert(s)
+    return format_short_alert(s)
 
 
 # ── Scan cycle ────────────────────────────────────────────────────────────────
@@ -690,8 +836,9 @@ def run_scan(tickers: list[dict]) -> int:
     """Returns number of alerts sent this cycle."""
     now = time.time()
 
-    short_candidates: list[dict] = []
-    long_candidates:  list[dict] = []
+    short_candidates:    list[dict] = []
+    long_candidates:     list[dict] = []
+    breakout_candidates: list[dict] = []
 
     for t in tickers:
         try:
@@ -709,20 +856,28 @@ def run_scan(tickers: list[dict]) -> int:
             if LONGS_ENABLED and change24 > -(KNIFE_MAX_DROP * 100):
                 if (price - low24) / low24 <= MAX_DIST_FROM_LOW:
                     long_candidates.append(t)
+            if BREAKOUTS_ENABLED and BREAKOUT_MIN_DAILY <= change24 <= BREAKOUT_MAX_DAILY:
+                breakout_candidates.append(t)
         except Exception:
             pass
 
     if SHORTS_ENABLED:
         log.info(
-            "Short pre-filter: %d/%d coins have >$%.1fM vol and are within %d%% of 24h high",
+            "Short    pre-filter: %d/%d coins have >$%.1fM vol and are within %d%% of 24h high",
             len(short_candidates), len(tickers),
             MIN_24H_QUOTE_VOL / 1_000_000, int(MAX_DIST_FROM_HIGH * 100),
         )
     if LONGS_ENABLED:
         log.info(
-            "Long  pre-filter: %d/%d coins have >$%.1fM vol and are within %d%% of 24h low (knife-filtered)",
+            "Long     pre-filter: %d/%d coins have >$%.1fM vol and are within %d%% of 24h low (knife-filtered)",
             len(long_candidates), len(tickers),
             MIN_24H_QUOTE_VOL / 1_000_000, int(MAX_DIST_FROM_LOW * 100),
+        )
+    if BREAKOUTS_ENABLED:
+        log.info(
+            "Breakout pre-filter: %d/%d coins up %.0f–%.0f%% on day",
+            len(breakout_candidates), len(tickers),
+            BREAKOUT_MIN_DAILY, BREAKOUT_MAX_DAILY,
         )
 
     signals = 0
@@ -747,11 +902,17 @@ def run_scan(tickers: list[dict]) -> int:
                                 symbol, tf, sig["rsi6"], sig["recent_move"],
                                 sig["dist_pct"], sig["wick_ratio"],
                             )
-                        else:
+                        elif direction == "long":
                             log.info(
                                 "LONG   %-15s [%3s]  RSI6=%-5.1f  dump=-%.1f%%  %.2f%% from low   wick=%.0f%%  vol=%.1fx",
                                 symbol, tf, sig["rsi6"], sig["recent_move"],
                                 sig["dist_pct"], sig["wick_ratio"], sig["vol_mult"],
+                            )
+                        else:  # breakout
+                            log.info(
+                                "BREAK  %-15s [%3s]  RSI6=%-5.1f  pump=+%.1f%%  vol=%.1fx  stop=-%.1f%%",
+                                symbol, tf, sig["rsi6"], sig["recent_move"],
+                                sig["vol_mult"], sig["stop_pct"],
                             )
                         send_telegram(format_alert(sig))
                         _alerted[key] = now
@@ -760,8 +921,9 @@ def run_scan(tickers: list[dict]) -> int:
                     log.debug("Error %s %s: %s", symbol, tf, e)
                 time.sleep(0.1)  # gentle rate limiting
 
-    _scan_candidates(short_candidates, check_short_signal, "short")
-    _scan_candidates(long_candidates,  check_long_signal,  "long")
+    _scan_candidates(short_candidates,    check_short_signal,    "short")
+    _scan_candidates(long_candidates,     check_long_signal,     "long")
+    _scan_candidates(breakout_candidates, check_breakout_signal, "breakout")
 
     log.info("Scan complete — %d alert(s) sent", signals)
     return signals
@@ -774,7 +936,8 @@ def main() -> None:
     log.info("=" * 60)
     log.info("Binance Perp Futures Short & Long Scanner")
     log.info("Timeframes : %s", TIMEFRAMES)
-    log.info("Mode       : %s  (shorts=%s, longs=%s)", MODE, SHORTS_ENABLED, LONGS_ENABLED)
+    log.info("Mode       : %s  (shorts=%s, longs=%s, breakouts=%s)",
+             MODE, SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED)
     log.info("Filter     : 24h vol > $%.1fM", MIN_24H_QUOTE_VOL / 1_000_000)
     if SHORTS_ENABLED:
         log.info("Short      : within %d%% of 24h high  RSI(6)>=%d  MACD-dec=%s  RSI-dec=%s  wick>=%.0f%%",
@@ -785,6 +948,12 @@ def main() -> None:
                  int(MAX_DIST_FROM_LOW * 100), RSI6_MAX,
                  REQUIRE_MACD_RISING, REQUIRE_RSI_RISING, MIN_LOWER_WICK_RATIO * 100,
                  MIN_VOL_MULTIPLIER, int(KNIFE_MAX_DROP * 100))
+    if BREAKOUTS_ENABLED:
+        log.info("Breakout   : 24h change %.0f–%.0f%%  RSI(6) %d–%d rising  MACD-rise=%s  full-stack=%s  vol>=%.1fx  max-stop=%.1f%%",
+                 BREAKOUT_MIN_DAILY, BREAKOUT_MAX_DAILY,
+                 BREAKOUT_RSI_MIN, BREAKOUT_RSI_MAX,
+                 REQUIRE_BREAKOUT_MACD_RISING, REQUIRE_BREAKOUT_FULL_STACK,
+                 MIN_VOL_MULTIPLIER, MAX_BREAKOUT_STOP_PCT)
     log.info("=" * 60)
 
     smoke_test()
