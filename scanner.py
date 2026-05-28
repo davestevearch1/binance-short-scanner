@@ -28,6 +28,7 @@ import time
 import logging
 import requests
 import pandas as pd
+from collections import defaultdict
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -219,12 +220,16 @@ def load_state() -> None:
                  len(_tracked), len(_results), STATE_FILE)
     except FileNotFoundError:
         pass
+    except Exception as e:
+        log.warning("state.json unreadable (%s) — starting fresh", e)
 
 
 def save_state() -> None:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=RESULTS_MAX_DAYS)).isoformat()
     fresh  = [r for r in _results if r.get("ts", "") >= cutoff]
-    Path(STATE_FILE).write_text(json.dumps({"tracked": _tracked, "results": fresh}, indent=2))
+    tmp = Path(STATE_FILE + ".tmp")
+    tmp.write_text(json.dumps({"tracked": _tracked, "results": fresh}, indent=2))
+    tmp.replace(Path(STATE_FILE))
 
 
 def _current_variant() -> str:
@@ -324,7 +329,6 @@ def _process_pending_checkups(tickers: list[dict], now: float) -> None:
 def format_stats() -> str:
     if not _results:
         return "📈 No completed trade outcomes yet.\nCheck back after alerts have had 2 hours to play out."
-    from collections import defaultdict
     grouped: dict[tuple, list[dict]] = defaultdict(list)
     for r in _results:
         grouped[(r["direction"], r.get("variant", "v2"))].append(r)
