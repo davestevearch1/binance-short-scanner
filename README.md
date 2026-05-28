@@ -1,21 +1,46 @@
-# Binance Short Scanner
+# Binance Short, Long & Breakout Scanner
 
-Automatically scans all USDT perpetual futures pairs on Binance and alerts you on Telegram when a coin is at an obvious short/retrace point — so you don't have to click through every chart manually.
+Automatically scans all USDT perpetual futures pairs on Binance and alerts you on Telegram when a coin matches one of three setups:
+
+- 🔴 **Short** — fade an exhausted pump near the 24h high
+- 🟢 **Bounce-long** — fade an exhausted dump (hammer) near the 24h low
+- 🚀 **Breakout-long** — catch a confirmed momentum shift (above EMA25, rising RSI, volume conviction)
+
+Each alert includes a stop-loss suggestion based on the trigger level (24h high for shorts, 24h low for bounces, EMA25 for breakouts).
+
+## Telegram modes (live-switchable by admin)
+
+| Command | Shorts | Bounce-longs | Breakouts |
+|---|---|---|---|
+| `/v1` | ✓ loose | — | — |
+| `/v2` (default) | ✓ strict | — | — |
+| `/long` | — | ✓ strict | ✓ strict |
+| `/v1Both` | ✓ loose | ✓ loose | ✓ loose |
+| `/v2Both` | ✓ strict | ✓ strict | ✓ strict |
+
+`/status` shows the current mode and the active filters for each side. `/help` lists all commands. `/pause` and `/resume` are admin-only.
+
+## Bounce-long vs breakout-long — what's the difference?
+
+Both go long, but the entry pattern is opposite:
+
+- **Bounce-long** fires after a sharp dump and a hammer candle near the 24h low. Bet: capitulation is over, price snaps back. Stop: just below the 24h low.
+- **Breakout-long** fires when a coin transitions from downtrend to uptrend with confirmation — above EMA25, RSI(6) crossing up, volume spike, 24h change +5–25%. Bet: momentum shift will continue. Stop: just below EMA25.
+
+The breakout catches the kind of move where a coin grinds +10–20% in a day without ever dumping or spiking — the bounce-long would miss it, and the short scanner won't fire either (RSI never hits 70+).
 
 ## How it works
 
 Every 60 seconds the scanner:
 
 1. Fetches all USDT perp futures tickers in one API call
-2. Pre-filters to any **liquid coin** (>$5M 24h volume) that's **still within 5% of its 24h high** — daily gain irrelevant; a flat coin that pumps in the last hour still gets caught
-3. For each candidate, fetches the **15m and 1h chart**
-4. Checks all five conditions for a short setup:
-   - RSI(6) ≥ 65 (overbought / elevated)
-   - Price within 5% of 24h high (at resistance, not already dumped)
-   - Recent pump ≥ 5% in last 10 candles on that timeframe
-   - EMA(7) > EMA(25) > EMA(99) (pump confirmed, all EMAs stacked bullish)
-   - MACD histogram > 0 (momentum still up, about to turn)
-5. Sends a Telegram alert when all conditions are met
+2. Builds up to three candidate lists (depending on the active mode):
+   - **Shorts**: liquid coins within 5% of 24h high
+   - **Bounce-longs**: liquid coins within 5% of 24h low, not down >20% on day (knife filter)
+   - **Breakouts**: liquid coins up 5–25% on day
+3. For each candidate, fetches the **15m and 1h chart** and runs EMA(7/25/99), RSI(6/12/24), MACD
+4. Sends a Telegram alert (with stop suggestion) when all conditions for that direction's strategy match
+5. Each direction has its own 1h cooldown per coin per timeframe — a single coin can alert short, then later breakout or bounce, independently
 
 ---
 
@@ -128,23 +153,28 @@ The scanner only reads **public** market data — no API key needed. It does **n
 
 ---
 
-## Example alert
+## Example alerts
 
+Short — fade an exhausted pump:
 ```
-🔴 SHORT SETUP — UBUSDT  [15m]
-2026-05-24 14:30 UTC
-
-Price:      0.15492
-24h High:   0.15777  (1.8% below — near top)
-24h Change: +28.14%   |  24h Vol: $94.5M
-Recent pump: +6.8% (last 10 candles on 15m)
-
-RSI(6):  67.4  |  RSI(12): 63.2  |  RSI(24): 63.6
-EMA7:    0.15469
-EMA25:   0.14976
-EMA99:   0.13836
-MACD:    0.00023
-
-⚠️ Coin is pumping, near 24h high, EMAs stacked — potential retrace incoming
-Consider SHORT entry
+🔴 SHORT SETUP — UBUSDT  [15m]  mode:v2
+...
+🛑 Stop suggestion: above 0.15856  (+2.3% from entry)
 ```
+
+Bounce-long — buy capitulation:
+```
+🟢 LONG SETUP — HUSDT  [15m]  mode:v2Both
+...
+🛑 Stop suggestion: below 0.19473  (-1.6% from entry)
+```
+
+Breakout-long — momentum shift confirmed:
+```
+🚀 BREAKOUT LONG — RIFUSDT  [1h]  mode:v2Both
+...
+EMA25: 0.06508  ← stop trigger
+🛑 Stop suggestion: below 0.06475  (-3.9% from entry)
+```
+
+The emoji prefix (🔴 / 🟢 / 🚀) makes the setup type recognisable at a glance.
