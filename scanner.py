@@ -23,11 +23,13 @@ Run:   python scanner.py
 """
 
 import os
+import json
 import time
 import logging
 import requests
 import pandas as pd
-from datetime import datetime, timezone
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -197,6 +199,158 @@ _paused = False
 _telegram_update_offset = 0
 COMMAND_POLL_INTERVAL_SEC = 5
 
+# ── Performance tracker ───────────────────────────────────────────────────────
+STATE_FILE            = "state.json"
+TRACKER_CHECKUP_1_SEC = 1800   # +30 minutes
+TRACKER_CHECKUP_2_SEC = 7200   # +2 hours (final)
+RESULTS_MAX_DAYS      = 30     # keep results for 30 days then purge
+
+_tracked: list[dict] = []  # alerts awaiting follow-up
+_results: list[dict] = []  # completed outcomes
+
+
+def load_state() -> None:
+    global _tracked, _results
+    try:
+        data = json.loads(Path(STATE_FILE).read_text())
+        _tracked = data.get("tracked", [])
+        _results = data.get("results", [])
+        log.info("Tracker: loaded %d pending, %d results from %s",
+                 len(_tracked), len(_results), STATE_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def save_state() -> None:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=RESULTS_MAX_DAYS)).isoformat()
+    fresh  = [r for r in _results if r.get("ts", "") >= cutoff]
+    Path(STATE_FILE).write_text(json.dumps({"tracked": _tracked, "results": fresh}, indent=2))
+
+
+def _current_variant() -> str:
+    return "v1" if MODE.lower() in ("v1", "v1both") else "v2"
+
+
+def track_alert(sig: dict) -> None:
+    entry = sig["price"]
+    _tracked.append({
+        "symbol":       sig["symbol"],
+        "timeframe":    sig["timeframe"],
+        "direction":    sig["direction"],
+        "variant":      _current_variant(),
+        "mode":         MODE,
+        "entry":        entry,
+        "stop":         sig["stop_price"],
+        "ts":           time.time(),
+        "extreme_seen": entry,
+        "checks_done":  0,
+    })
+    save_state()
+
+
+def format_checkup_message(item: dict, price: float, stop_hit: bool, final: bool) -> str:
+    direction = item["direction"]
+    entry     = item["entry"]
+    stop      = item["stop"]
+    label     = "SHORT" if direction == "short" else ("LONG" if direction == "long" else "BREAKOUT")
+    emoji     = "🔴" if direction == "short" else ("🟢" if direction == "long" else "🚀")
+    tag       = "(FINAL)" if final else "(+30 min)"
+    pct       = (price - entry) / entry * 100
+    if direction == "short":
+        moving_right = price < entry
+        pct_display  = f"{-pct:+.2f}%"  # show as positive when price fell (good for shorts)
+    else:
+        moving_right = price > entry
+        pct_display  = f"{pct:+.2f}%"
+    status = "🛑 STOP HIT" if stop_hit else ("✅ in profit" if moving_right else "⚠️ against")
+    return (
+        f"📊 {emoji} <b>{label} follow-up — {item['symbol']}</b> [{item['timeframe']}] {tag}\n"
+        f"Entry: {entry}   Stop: {stop}\n"
+        f"Now:   {price}   → {pct_display}   {status}\n"
+        f"Extreme seen: {item['extreme_seen']}"
+    )
+
+
+def _process_pending_checkups(tickers: list[dict], now: float) -> None:
+    if not _tracked:
+        return
+    price_map = {t["symbol"]: float(t["lastPrice"]) for t in tickers}
+    changed  = False
+    finished = []
+    for item in _tracked:
+        sym   = item["symbol"]
+        price = price_map.get(sym)
+        if price is None:
+            continue
+        direction = item["direction"]
+        if direction == "short":
+            item["extreme_seen"] = max(item["extreme_seen"], price)
+        else:
+            item["extreme_seen"] = min(item["extreme_seen"], price)
+        changed  = True
+        stop     = item["stop"]
+        stop_hit = (direction == "short" and item["extreme_seen"] > stop) or \
+                   (direction != "short" and item["extreme_seen"] < stop)
+        elapsed  = now - item["ts"]
+        if item["checks_done"] == 0 and elapsed >= TRACKER_CHECKUP_1_SEC:
+            send_telegram(format_checkup_message(item, price, stop_hit, final=False))
+            item["checks_done"] = 1
+        elif item["checks_done"] == 1 and elapsed >= TRACKER_CHECKUP_2_SEC:
+            send_telegram(format_checkup_message(item, price, stop_hit, final=True))
+            entry   = item["entry"]
+            pct     = (price - entry) / entry * 100
+            if direction == "short":
+                pct = -pct  # positive means price fell (good for shorts)
+            outcome = "loss" if stop_hit else ("win" if pct > 0 else "loss")
+            _results.append({
+                "symbol":    sym,
+                "direction": direction,
+                "variant":   item.get("variant", "v2"),
+                "timeframe": item["timeframe"],
+                "mode":      item.get("mode", MODE),
+                "entry":     entry,
+                "stop":      stop,
+                "outcome":   outcome,
+                "final_pct": round(pct, 2),
+                "ts":        datetime.fromtimestamp(item["ts"], tz=timezone.utc).isoformat(),
+            })
+            finished.append(item)
+    for item in finished:
+        _tracked.remove(item)
+    if changed or finished:
+        save_state()
+
+
+def format_stats() -> str:
+    if not _results:
+        return "📈 No completed trade outcomes yet.\nCheck back after alerts have had 2 hours to play out."
+    from collections import defaultdict
+    grouped: dict[tuple, list[dict]] = defaultdict(list)
+    for r in _results:
+        grouped[(r["direction"], r.get("variant", "v2"))].append(r)
+    lines = [f"📈 <b>Scanner stats</b> ({len(_results)} completed, last {RESULTS_MAX_DAYS}d)\n"]
+    for direction, emoji, label in [
+        ("short",    "🔴", "Shorts"),
+        ("long",     "🟢", "Bounces"),
+        ("breakout", "🚀", "Breakouts"),
+    ]:
+        dir_items = [r for r in _results if r["direction"] == direction]
+        if not dir_items:
+            continue
+        lines.append(f"\n{emoji} <b>{label}</b>")
+        for variant in ("v1", "v2"):
+            items = grouped.get((direction, variant), [])
+            if not items:
+                continue
+            wins    = sum(1 for r in items if r["outcome"] == "win")
+            losses  = len(items) - wins
+            pct_win = wins / len(items) * 100
+            avg_pct = sum(r["final_pct"] for r in items) / len(items)
+            lines.append(
+                f"  {variant}: {wins}W / {losses}L = {pct_win:.0f}%   avg {avg_pct:+.1f}% at 2h"
+            )
+    return "\n".join(lines)
+
 
 # ── Smoke test ────────────────────────────────────────────────────────────────
 def smoke_test() -> None:
@@ -304,6 +458,7 @@ def format_help(is_admin: bool) -> str:
     public = (
         "<b>Commands</b>\n"
         "/status — show current scanner state\n"
+        "/stats  — win/loss breakdown per strategy (v1 vs v2)\n"
         "/help   — show this message"
     )
     if not is_admin:
@@ -372,6 +527,9 @@ def handle_command(text: str, from_id: int, chat_id: int) -> None:
         _paused = False
         log.info("Scanner resumed via Telegram by admin")
         send_telegram("▶ <b>Scanner resumed</b> by admin")
+
+    elif cmd_root == "stats":
+        send_telegram_reply(chat_id, format_stats())
 
     elif cmd_root == "help":
         send_telegram_reply(chat_id, format_help(is_admin))
@@ -835,6 +993,7 @@ def format_alert(s: dict) -> str:
 def run_scan(tickers: list[dict]) -> int:
     """Returns number of alerts sent this cycle."""
     now = time.time()
+    _process_pending_checkups(tickers, now)
 
     short_candidates:    list[dict] = []
     long_candidates:     list[dict] = []
@@ -915,6 +1074,7 @@ def run_scan(tickers: list[dict]) -> int:
                                 sig["vol_mult"], sig["stop_pct"],
                             )
                         send_telegram(format_alert(sig))
+                        track_alert(sig)
                         _alerted[key] = now
                         signals += 1
                 except Exception as e:
@@ -956,6 +1116,7 @@ def main() -> None:
                  MIN_VOL_MULTIPLIER, MAX_BREAKOUT_STOP_PCT)
     log.info("=" * 60)
 
+    load_state()
     smoke_test()
     _last_heartbeat = time.time()
     drain_telegram_updates()  # skip any backlog from before startup
