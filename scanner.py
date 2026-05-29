@@ -67,9 +67,9 @@ STOP_BUFFER_PCT    = 0.005      # 0.5% buffer past the trigger level for stop su
 
 # Breakout-long (momentum trade) fixed thresholds
 BREAKOUT_MIN_DAILY       = 5.0   # Breakout pre-filter: 24h change >= +5%
-BREAKOUT_MAX_DAILY       = 25.0  # Breakout pre-filter: 24h change <= +25% (skip exhausted runners)
+BREAKOUT_MAX_DAILY       = 50.0  # Breakout pre-filter: 24h change <= +50% (skip exhausted runners)
 BREAKOUT_MIN_RECENT_PUMP = 0.03  # Breakout: price up >=3% in last 10 candles on this TF
-BREAKOUT_RSI_MAX         = 70    # Breakout: RSI(6) must be < 70 (else short scanner zone)
+BREAKOUT_RSI_MAX         = 85    # Breakout: RSI(6) must be < 85 (rising RSI separates from shorts)
 MAX_BREAKOUT_STOP_PCT    = 5.0   # Breakout: skip if stop would be >5% wide (bad R:R)
 
 # ── Mode preset (live-switchable via Telegram) ────────────────────────────────
