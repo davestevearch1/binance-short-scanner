@@ -10,15 +10,33 @@ Each alert includes a stop-loss suggestion based on the trigger level (24h high 
 
 ## Telegram modes (live-switchable by admin)
 
-| Command | Shorts | Bounce-longs | Breakouts |
-|---|---|---|---|
-| `/v1` | ✓ loose | — | — |
-| `/v2` (default) | ✓ strict | — | — |
-| `/long` | — | ✓ strict | ✓ strict |
-| `/v1Both` | ✓ loose | ✓ loose | ✓ loose |
-| `/v2Both` | ✓ strict | ✓ strict | ✓ strict |
+A mode controls **which alerts are sent** — it does *not* limit what's measured.
+All three strategies use the strict rules and run on every scan.
+
+| Command | Sends alerts for |
+|---|---|
+| `/short` | Shorts |
+| `/long` (default) | Bounce-longs + Breakouts |
+| `/both` | Shorts + Bounce-longs + Breakouts |
+
+(`/v2` and `/v2Both` still work as hidden aliases for `/short` and `/both`.)
 
 `/status` shows the current mode and the active filters for each side. `/help` lists all commands. `/pause` and `/resume` are admin-only.
+
+### Shadow-logging: data on every strategy, even when not alerting
+
+Every scan **evaluates and records** all three strategies on **both timeframes**,
+regardless of the active mode — but only *sends* alerts for the mode's directions
+on the alert timeframe (1h). So even while running `/long`, the scanner silently
+measures how shorts (and every 15m signal) *would* have done, using the real
+production code path and live forward prices (no backtest/lookahead bias).
+
+`/stats` breaks the +2h outcomes down **by strategy and timeframe**, and notes how
+many were actually sent vs shadow-measured. Each tracked trade also records its
+MFE/MAE (max favorable/adverse move) and an indicator snapshot for later analysis.
+
+- **Measure** all timeframes: `TIMEFRAMES = ["15m", "1h"]`
+- **Alert** only: `ALERT_TIMEFRAMES = ["1h"]`
 
 ## Bounce-long vs breakout-long — what's the difference?
 
@@ -34,12 +52,12 @@ The breakout catches the kind of move where a coin grinds +10–20% in a day wit
 Every 60 seconds the scanner:
 
 1. Fetches all USDT perp futures tickers in one API call
-2. Builds up to three candidate lists (depending on the active mode):
+2. Builds all three candidate lists (every scan, regardless of mode):
    - **Shorts**: liquid coins within 5% of 24h high
    - **Bounce-longs**: liquid coins within 5% of 24h low, not down >20% on day (knife filter)
    - **Breakouts**: liquid coins up 5–25% on day
 3. For each candidate, fetches the **15m and 1h chart** and runs EMA(7/25/99), RSI(6/12/24), MACD
-4. Sends a Telegram alert (with stop suggestion) when all conditions for that direction's strategy match
+4. **Records** every matching signal for +2h outcome tracking (shadow-logging), and **sends** a Telegram alert (with stop suggestion) only when the signal's direction is enabled in the current mode and its timeframe is an alert timeframe (1h)
 5. Each direction has its own 1h cooldown per coin per timeframe — a single coin can alert short, then later breakout or bounce, independently
 
 ---
@@ -157,21 +175,21 @@ The scanner only reads **public** market data — no API key needed. It does **n
 
 Short — fade an exhausted pump:
 ```
-🔴 SHORT SETUP — UBUSDT  [15m]  mode:v2
+🔴 SHORT SETUP — UBUSDT  [1h]  mode:short
 ...
 🛑 Stop suggestion: above 0.15856  (+2.3% from entry)
 ```
 
 Bounce-long — buy capitulation:
 ```
-🟢 LONG SETUP — HUSDT  [15m]  mode:v2Both
+🟢 LONG SETUP — HUSDT  [1h]  mode:long
 ...
 🛑 Stop suggestion: below 0.19473  (-1.6% from entry)
 ```
 
 Breakout-long — momentum shift confirmed:
 ```
-🚀 BREAKOUT LONG — RIFUSDT  [1h]  mode:v2Both
+🚀 BREAKOUT LONG — RIFUSDT  [1h]  mode:long
 ...
 EMA25: 0.06508  ← stop trigger
 🛑 Stop suggestion: below 0.06475  (-3.9% from entry)
