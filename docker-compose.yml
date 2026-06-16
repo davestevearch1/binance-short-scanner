@@ -3,3 +3,12 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Persist the trade-tracker state on the named volume below so the history
+      # survives container restarts and redeploys.
+      - STATE_FILE=/app/data/state.json
+    volumes:
+      - scanner-data:/app/data
+
+volumes:
+  scanner-data:

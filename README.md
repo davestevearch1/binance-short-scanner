@@ -132,6 +132,11 @@ docker compose up -d   # builds image, starts container, auto-restarts on crash
 docker compose logs -f # tail live logs
 ```
 
+The trade-tracker history (`state.json`) is persisted on a named Docker volume
+(`scanner-data`, mounted at `/app/data` via `STATE_FILE`), so it survives
+restarts and redeploys. For a non-Docker deploy, set `STATE_FILE` to a path
+outside the working tree to keep history across `git pull`s.
+
 ### Option B: Cheap VPS — Hetzner CX21 (~$4/mo) or DigitalOcean Droplet (~$6/mo)
 
 ```bash

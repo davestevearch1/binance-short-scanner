@@ -190,7 +190,9 @@ _telegram_update_offset = 0
 COMMAND_POLL_INTERVAL_SEC = 5
 
 # ── Performance tracker ───────────────────────────────────────────────────────
-STATE_FILE            = "state.json"
+# Override STATE_FILE to a mounted path (e.g. /app/data/state.json) so the trade
+# history survives container restarts/redeploys.
+STATE_FILE            = os.getenv("STATE_FILE", "state.json").strip() or "state.json"
 TRACKER_CHECKUP_1_SEC = 1800   # +30 minutes
 TRACKER_CHECKUP_2_SEC = 7200   # +2 hours (final)
 RESULTS_MAX_DAYS      = 30     # keep results for 30 days then purge
@@ -216,9 +218,11 @@ def load_state() -> None:
 def save_state() -> None:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=RESULTS_MAX_DAYS)).isoformat()
     fresh  = [r for r in _results if r.get("ts", "") >= cutoff]
+    path = Path(STATE_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)  # ensure mounted data dir exists
     tmp = Path(STATE_FILE + ".tmp")
     tmp.write_text(json.dumps({"tracked": _tracked, "results": fresh}, indent=2))
-    tmp.replace(Path(STATE_FILE))
+    tmp.replace(path)
 
 
 # Indicator fields copied from the signal onto every tracked trade so a future
