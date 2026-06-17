@@ -79,6 +79,29 @@ BREAKOUT_MIN_RECENT_PUMP = 0.03  # Breakout: price up >=3% in last 10 candles on
 BREAKOUT_RSI_MAX         = 85    # Breakout: RSI(6) must be < 85 (rising RSI separates from shorts)
 MAX_BREAKOUT_STOP_PCT    = 5.0   # Breakout: skip if stop would be >5% wide (bad R:R)
 
+# Breakdown-short (trend-continuation short) fixed thresholds — the downside mirror
+# of breakout-long. This shorts coins already TRENDING DOWN (negative 24h change),
+# unlike the fade-short which shorts overextended pumps near the 24h high.
+BREAKDOWN_DROP_MIN        = 5.0   # Breakdown pre-filter: 24h change <= -5% (real down move)
+BREAKDOWN_DROP_MAX        = 40.0  # Breakdown pre-filter: 24h change >= -40% (skip capitulation/bounce risk)
+BREAKDOWN_MIN_RECENT_DUMP = 0.03  # Breakdown: price down >=3% in last 10 candles on this TF
+BREAKDOWN_RSI_MIN         = 15    # Breakdown: RSI(6) must stay > 15 (not yet capitulated)
+MAX_BREAKDOWN_STOP_PCT    = 5.0   # Breakdown: skip if stop above EMA25 would be >5% wide (bad R:R)
+
+# ── Daily-% windows recorded on every signal (computed from klines already fetched) ──
+# change_2h / change_utc / blowoff are *measured and recorded* on every trade so future
+# tuning is evidence-based. FADE_MIN_DAILY_CHANGE is an optional hard floor on the fade
+# short: None disables it (default); set a positive number to require the coin be up at
+# least that much on the day before a fade-short can alert.
+FADE_MIN_DAILY_CHANGE = None    # None = off; e.g. 20.0 → only fade-short coins up >=20%/day
+BLOWOFF_PCT           = 100.0   # tag coins up >=100% on the day as blow-off tops
+
+# ── Market regime (computed each scan from the full ticker list) ──────────────────
+# A quiet/low-volatility market is "dead" — we still measure everything but suppress
+# Telegram sends so the alert stream stays meaningful. Conservative + tunable.
+REGIME_QUIET_AVG_ABS     = 3.0    # avg |24h change| across liquid coins below this = "quiet"
+REGIME_SUPPRESS_ON_QUIET = True   # hard gate: shadow-only (no sends) on quiet days
+
 # ── Mode preset (live-switchable via Telegram) ────────────────────────────────
 # Three modes, all using the strict (v2) strategy rules. A mode only controls
 # which directions are *sent* as Telegram alerts — shadow-logging measures every
@@ -89,11 +112,20 @@ VALID_MODES  = ("short", "long", "both")  # matched lowercased
 # Hidden aliases so the admin's old commands still work.
 _MODE_ALIASES = {"v2": "short", "v2both": "both"}
 
+# Directions whose P&L is favorable when price FALLS. Used everywhere the tracker
+# asks "is this a short?" so the breakdown short is treated like the fade short.
+SHORT_DIRECTIONS = ("short", "breakdown")
+
+# Display label + emoji per direction (shared by checkup messages and /stats).
+_DIRECTION_LABEL = {"short": "SHORT", "breakdown": "BREAKDOWN", "long": "LONG", "breakout": "BREAKOUT"}
+_DIRECTION_EMOJI = {"short": "🔴", "breakdown": "🔻", "long": "🟢", "breakout": "🚀"}
+
 # These globals are set by apply_mode() at startup and on each Telegram command.
 MODE:                   str
 SHORTS_ENABLED:         bool   # "enabled" now means "alerts are sent for this direction"
 LONGS_ENABLED:          bool
 BREAKOUTS_ENABLED:      bool
+BREAKDOWNS_ENABLED:     bool
 # Short-side thresholds (strict v2)
 RSI6_MIN:               int
 REQUIRE_MACD_DECLINING: bool
@@ -108,6 +140,10 @@ MIN_LOWER_WICK_RATIO:   float
 BREAKOUT_RSI_MIN:               int
 REQUIRE_BREAKOUT_FULL_STACK:    bool
 REQUIRE_BREAKOUT_MACD_RISING:   bool
+# Breakdown-side thresholds (downside mirror of breakout)
+BREAKDOWN_RSI_MAX:              int
+REQUIRE_BREAKDOWN_FULL_STACK:   bool
+REQUIRE_BREAKDOWN_MACD_FALLING: bool
 
 # Canonical display names.
 _MODE_DISPLAY = {
@@ -135,27 +171,35 @@ def _apply_breakout_strategy() -> None:
         60, True, True
 
 
+def _apply_breakdown_strategy() -> None:
+    global BREAKDOWN_RSI_MAX, REQUIRE_BREAKDOWN_FULL_STACK, REQUIRE_BREAKDOWN_MACD_FALLING
+    BREAKDOWN_RSI_MAX, REQUIRE_BREAKDOWN_FULL_STACK, REQUIRE_BREAKDOWN_MACD_FALLING = \
+        40, True, True
+
+
 def apply_mode(mode: str) -> bool:
     """
     Switch scanner mode. Case-insensitive. Returns True if applied, False if unknown.
     A mode only controls which directions are *sent* as alerts; all strategies use
     the strict (v2) rules and are measured on every timeframe regardless.
-      short → send shorts only
+      short → send shorts (fade + breakdown)
       long  → send bounce-longs + breakouts
-      both  → send all three
+      both  → send all
     """
-    global MODE, SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED
+    global MODE, SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED, BREAKDOWNS_ENABLED
     key = mode.strip().lower()
     key = _MODE_ALIASES.get(key, key)
     if key not in VALID_MODES:
         return False
     MODE = _MODE_DISPLAY[key]
-    SHORTS_ENABLED    = key in ("short", "both")
-    LONGS_ENABLED     = key in ("long",  "both")
-    BREAKOUTS_ENABLED = key in ("long",  "both")
+    SHORTS_ENABLED     = key in ("short", "both")
+    BREAKDOWNS_ENABLED = key in ("short", "both")
+    LONGS_ENABLED      = key in ("long",  "both")
+    BREAKOUTS_ENABLED  = key in ("long",  "both")
     _apply_short_strategy()
     _apply_long_strategy()
     _apply_breakout_strategy()
+    _apply_breakdown_strategy()
     return True
 
 
@@ -200,6 +244,11 @@ RESULTS_MAX_DAYS      = 30     # keep results for 30 days then purge
 _tracked: list[dict] = []  # alerts awaiting follow-up
 _results: list[dict] = []  # completed outcomes
 
+# Market regime, recomputed at the top of every run_scan() from the full ticker
+# list. Initialised neutral so /status and the heartbeat can read it before the
+# first scan completes.
+_regime: dict = {"avg_abs": 0.0, "breadth": 0.0, "n": 0, "quiet": False}
+
 
 def load_state() -> None:
     global _tracked, _results
@@ -230,6 +279,7 @@ def save_state() -> None:
 _SNAPSHOT_KEYS = (
     "rsi6", "rsi12", "rsi24", "ema7", "ema25", "ema99", "macd_hist",
     "vol_mult", "change24", "wick_ratio", "dist_pct", "recent_move", "stop_pct",
+    "change_2h", "change_utc", "blowoff",
 )
 
 
@@ -246,6 +296,11 @@ def track_alert(sig: dict, alerted: bool) -> None:
     alerts or follow-up messages.
     """
     entry = sig["price"]
+    snapshot = _signal_snapshot(sig)
+    # Stamp the market regime at entry so /stats can later correlate outcomes with
+    # how lively the broader market was when the signal fired.
+    snapshot["regime_avg_abs"] = round(_regime["avg_abs"], 2)
+    snapshot["regime_breadth"] = round(_regime["breadth"], 1)
     _tracked.append({
         "symbol":       sig["symbol"],
         "timeframe":    sig["timeframe"],
@@ -259,7 +314,7 @@ def track_alert(sig: dict, alerted: bool) -> None:
         "extreme_seen": entry,   # worst adverse price (drives stop + MAE)
         "favor_seen":   entry,   # best favorable price (drives MFE)
         "checks_done":  0,
-        "snapshot":     _signal_snapshot(sig),
+        "snapshot":     snapshot,
     })
     save_state()
 
@@ -268,11 +323,11 @@ def format_checkup_message(item: dict, price: float, stop_hit: bool, final: bool
     direction = item["direction"]
     entry     = item["entry"]
     stop      = item["stop"]
-    label     = "SHORT" if direction == "short" else ("LONG" if direction == "long" else "BREAKOUT")
-    emoji     = "🔴" if direction == "short" else ("🟢" if direction == "long" else "🚀")
+    label     = _DIRECTION_LABEL.get(direction, direction.upper())
+    emoji     = _DIRECTION_EMOJI.get(direction, "•")
     tag       = "(FINAL)" if final else "(+30 min)"
     pct       = (price - entry) / entry * 100
-    if direction == "short":
+    if direction in SHORT_DIRECTIONS:
         moving_right = price < entry
         pct_display  = f"{-pct:+.2f}%"  # show as positive when price fell (good for shorts)
     else:
@@ -300,7 +355,8 @@ def _process_pending_checkups(tickers: list[dict], now: float) -> None:
             continue
         direction = item["direction"]
         entry     = item["entry"]
-        if direction == "short":
+        is_short  = direction in SHORT_DIRECTIONS
+        if is_short:
             item["extreme_seen"] = max(item["extreme_seen"], price)          # adverse (highest)
             item["favor_seen"]   = min(item.get("favor_seen", entry), price)  # favorable (lowest)
         else:
@@ -309,8 +365,8 @@ def _process_pending_checkups(tickers: list[dict], now: float) -> None:
         changed  = True
         stop     = item["stop"]
         alerted  = item.get("alerted", True)  # old records (pre-shadow) were all real alerts
-        stop_hit = (direction == "short" and item["extreme_seen"] > stop) or \
-                   (direction != "short" and item["extreme_seen"] < stop)
+        stop_hit = (is_short and item["extreme_seen"] > stop) or \
+                   (not is_short and item["extreme_seen"] < stop)
         elapsed  = now - item["ts"]
         if item["checks_done"] == 0 and elapsed >= TRACKER_CHECKUP_1_SEC:
             if alerted:
@@ -320,12 +376,12 @@ def _process_pending_checkups(tickers: list[dict], now: float) -> None:
             if alerted:
                 send_telegram(format_checkup_message(item, price, stop_hit, final=True))
             pct     = (price - entry) / entry * 100
-            if direction == "short":
+            if is_short:
                 pct = -pct  # positive means price fell (good for shorts)
             outcome = "loss" if stop_hit else ("win" if pct > 0 else "loss")
             favor   = item.get("favor_seen", entry)
             adverse = item.get("extreme_seen", entry)
-            if direction == "short":
+            if is_short:
                 mfe = (entry - favor) / entry * 100
                 mae = (adverse - entry) / entry * 100
             else:
@@ -367,9 +423,10 @@ def format_stats() -> str:
         f"   {n_alerted} sent · {len(_results) - n_alerted} shadow-measured\n",
     ]
     for direction, emoji, label in [
-        ("short",    "🔴", "Shorts"),
-        ("long",     "🟢", "Bounces"),
-        ("breakout", "🚀", "Breakouts"),
+        ("short",     "🔴", "Fade shorts"),
+        ("breakdown", "🔻", "Breakdown shorts"),
+        ("long",      "🟢", "Bounces"),
+        ("breakout",  "🚀", "Breakouts"),
     ]:
         dir_items = [r for r in _results if r["direction"] == direction]
         if not dir_items:
@@ -413,7 +470,9 @@ def smoke_test() -> None:
              len(TELEGRAM_BROADCAST_IDS), TELEGRAM_CHAT_ID or "(none)")
     sides = []
     if SHORTS_ENABLED:
-        sides.append("shorts")
+        sides.append("fade-shorts")
+    if BREAKDOWNS_ENABLED:
+        sides.append("breakdown-shorts")
     if LONGS_ENABLED:
         sides.append("bounce-longs")
     if BREAKOUTS_ENABLED:
@@ -480,13 +539,29 @@ def format_status() -> str:
         f"  Vol ≥ {MIN_VOL_MULTIPLIER}×  |  24h change {BREAKOUT_MIN_DAILY:.0f}–{BREAKOUT_MAX_DAILY:.0f}%"
     ) if BREAKOUTS_ENABLED else "  (shadow only — measured, not alerting)"
 
+    breakdown_info = (
+        f"  24h change −{BREAKDOWN_DROP_MIN:.0f} to −{BREAKDOWN_DROP_MAX:.0f}%\n"
+        f"  Price < EMA25  |  EMA7 < EMA25{' < EMA99' if REQUIRE_BREAKDOWN_FULL_STACK else ''}\n"
+        f"  RSI(6) {BREAKDOWN_RSI_MIN}–{BREAKDOWN_RSI_MAX}, falling\n"
+        f"  MACD < 0{', falling' if REQUIRE_BREAKDOWN_MACD_FALLING else ''}\n"
+        f"  Vol ≥ {MIN_VOL_MULTIPLIER}×  |  max-stop {MAX_BREAKDOWN_STOP_PCT:.0f}%"
+    ) if BREAKDOWNS_ENABLED else "  (shadow only — measured, not alerting)"
+
+    regime_line = (
+        f"avg |24h| {_regime['avg_abs']:.1f}%  ·  {_regime['breadth']:.0f}% up  ·  {_regime['n']} liquid"
+        + ("  ·  ⚠️ QUIET — sends off" if (_regime["quiet"] and REGIME_SUPPRESS_ON_QUIET) else "")
+    )
+
     return (
         f"🟢 <b>Scanner status</b>\n"
         f"Mode:   <b>{MODE}</b>\n"
         f"State:  {'⏸ Paused' if _paused else '▶ Running'}\n"
         f"Scans:  {_total_scans}  |  Alerts: {_total_alerts}\n"
+        f"Market: {regime_line}\n"
         f"\n"
-        f"📉 <b>Shorts</b>\n{short_info}\n"
+        f"🔴 <b>Fade shorts</b>\n{short_info}\n"
+        f"\n"
+        f"🔻 <b>Breakdown shorts</b>\n{breakdown_info}\n"
         f"\n"
         f"📈 <b>Bounce-Longs</b>\n{long_info}\n"
         f"\n"
@@ -507,9 +582,9 @@ def format_help(is_admin: bool) -> str:
         public + "\n\n"
         "<b>Admin — mode commands</b>  (controls which alerts are sent;\n"
         "all strategies are measured on every timeframe regardless)\n"
-        "/short — send shorts only\n"
+        "/short — send shorts (fade + breakdown)\n"
         "/long  — send bounce-longs + breakouts  (default)\n"
-        "/both  — send shorts + bounce-longs + breakouts\n"
+        "/both  — send all (fade + breakdown shorts, bounce-longs, breakouts)\n"
         "\n"
         "<b>Admin — controls</b>\n"
         "/pause  — stop scanning (alerts off)\n"
@@ -700,6 +775,44 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     }
 
 
+# Minutes per timeframe — used to translate "2 hours" into a candle count.
+_TF_MINUTES = {"15m": 15, "1h": 60}
+
+
+def _change_windows(df: pd.DataFrame, tf: str, price: float, change24: float) -> dict:
+    """Daily-% context recorded on every signal, computed from klines already fetched.
+
+    `price` is the last CLOSED candle's close (compute_indicators' "price"), used as
+    the right edge of both windows so they line up with the signal's entry price.
+      change_2h  — % move over the last 2 hours on this timeframe
+      change_utc — % move since 00:00 UTC (Binance's anchored daily change)
+      blowoff    — True when the coin is up >= BLOWOFF_PCT on the day (parabolic top)
+    """
+    c = df["close"]
+    # 2h window — candle count spanning 2 hours on this timeframe.
+    n2h = max(1, 120 // _TF_MINUTES.get(tf, 60))
+    idx = -2 - n2h
+    change_2h = 0.0
+    if len(c) >= -idx:
+        base = c.iloc[idx]
+        change_2h = (price - base) / base * 100 if base > 0 else 0.0
+
+    # UTC-day window — first candle at/after today's 00:00 UTC. open_time is int ms.
+    now = datetime.now(timezone.utc)
+    midnight_ms = int(datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp() * 1000)
+    mask = df["open_time"].astype("int64") >= midnight_ms
+    change_utc = 0.0
+    if bool(mask.any()):
+        day_open = float(df["open"].iloc[int(mask.values.argmax())])
+        change_utc = (price - day_open) / day_open * 100 if day_open > 0 else 0.0
+
+    return {
+        "change_2h":  round(change_2h, 2),
+        "change_utc": round(change_utc, 2),
+        "blowoff":    max(change24, change_utc) >= BLOWOFF_PCT,
+    }
+
+
 # ── Signal logic ──────────────────────────────────────────────────────────────
 def check_short_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> dict | None:
     """
@@ -717,8 +830,14 @@ def check_short_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> 
     """
     ind    = compute_indicators(df)
     c      = df["close"]
-    price  = ind["price"]
-    high24 = float(ticker["highPrice"])
+    price    = ind["price"]
+    high24   = float(ticker["highPrice"])
+    change24 = float(ticker["priceChangePercent"])
+
+    # Optional daily-pump floor — only fade coins already up >= the floor on the day.
+    # Off by default (FADE_MIN_DAILY_CHANGE is None); recorded-only until tuned on data.
+    if FADE_MIN_DAILY_CHANGE is not None and change24 < FADE_MIN_DAILY_CHANGE:
+        return None
 
     if ind["r6"] < RSI6_MIN:
         return None
@@ -756,7 +875,7 @@ def check_short_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> 
         "timeframe":   tf,
         "price":       price,
         "high24":      high24,
-        "change24":    float(ticker["priceChangePercent"]),
+        "change24":    change24,
         "quote_vol":   float(ticker["quoteVolume"]),
         "dist_pct":    round(dist_pct * 100, 2),
         "recent_move": round(recent_pump * 100, 2),
@@ -770,6 +889,7 @@ def check_short_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> 
         "wick_ratio":  round(wick_ratio * 100, 1),
         "stop_price":  round(stop_price, 8),
         "stop_pct":    round(stop_pct, 2),
+        **_change_windows(df, tf, price, change24),
     }
 
 
@@ -858,6 +978,7 @@ def check_long_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> d
         "vol_mult":    round(vol_mult, 2),
         "stop_price":  round(stop_price, 8),
         "stop_pct":    round(stop_pct, 2),
+        **_change_windows(df, tf, price, change24),
     }
 
 
@@ -939,6 +1060,91 @@ def check_breakout_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) 
         "vol_mult":    round(vol_mult, 2),
         "stop_price":  round(stop_price, 8),
         "stop_pct":    round(stop_pct, 2),
+        **_change_windows(df, tf, price, change24),
+    }
+
+
+def check_breakdown_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> dict | None:
+    """
+    Returns a breakdown-short signal dict when the coin matches a trend-continuation
+    short, else None. This is the downside mirror of check_breakout_signal: it shorts
+    coins already TRENDING DOWN that are breaking lower with conviction — something the
+    fade-short (which needs a bullish stack near the 24h high) can never do.
+
+    Fixed conditions (always required):
+      1. 24h change in [-BREAKDOWN_DROP_MAX, -BREAKDOWN_DROP_MIN] — down, not capitulated
+      2. Price < EMA25                                 — below the trend trigger
+      3. EMA7 < EMA25                                  — fast EMA momentum negative
+      4. MACD histogram < 0                            — momentum confirmed down
+      5. RSI(6) in (BREAKDOWN_RSI_MIN, BREAKDOWN_RSI_MAX] and falling
+                                                       — sellers in control, not capitulated
+      6. Candle volume >= MIN_VOL_MULTIPLIER × 20c avg — real selling conviction
+      7. Recent dump >= BREAKDOWN_MIN_RECENT_DUMP      — breakdown fresh on this TF
+      8. Stop distance <= MAX_BREAKDOWN_STOP_PCT       — skip late/wide-stop entries
+
+    Strict conditions (always required):
+      9. EMA stack full bearish (EMA7<EMA25<EMA99)
+     10. MACD histogram falling
+    """
+    ind      = compute_indicators(df)
+    c        = df["close"]
+    price    = ind["price"]
+    change24 = float(ticker["priceChangePercent"])
+
+    # Pre-filter conditions repeated here for safety (main pre-filter in run_scan)
+    if not (-BREAKDOWN_DROP_MAX <= change24 <= -BREAKDOWN_DROP_MIN):
+        return None
+
+    # Fixed conditions (downside mirror of breakout)
+    if price >= ind["e25"]:
+        return None
+    if ind["e7"] >= ind["e25"]:
+        return None
+    if REQUIRE_BREAKDOWN_FULL_STACK and not (ind["e7"] < ind["e25"] < ind["e99"]):
+        return None
+    if ind["mh"] >= 0:
+        return None
+    if REQUIRE_BREAKDOWN_MACD_FALLING and ind["mh"] >= ind["mh_prev"]:
+        return None
+    if not (BREAKDOWN_RSI_MIN < ind["r6"] <= BREAKDOWN_RSI_MAX):
+        return None
+    if ind["r6"] >= ind["r6_prev"]:
+        return None
+    if ind["avg_vol_20"] > 0 and ind["candle_vol"] < MIN_VOL_MULTIPLIER * ind["avg_vol_20"]:
+        return None
+
+    lookback    = min(10, len(c) - 2)
+    past_price  = c.iloc[-2 - lookback]
+    recent_dump = (past_price - price) / past_price if past_price > 0 else 0
+    if recent_dump < BREAKDOWN_MIN_RECENT_DUMP:
+        return None
+
+    stop_price = ind["e25"] * (1 + STOP_BUFFER_PCT)
+    stop_pct   = (stop_price - price) / price * 100
+    if stop_pct > MAX_BREAKDOWN_STOP_PCT:
+        return None
+
+    vol_mult = ind["candle_vol"] / ind["avg_vol_20"] if ind["avg_vol_20"] > 0 else 0.0
+
+    return {
+        "direction":   "breakdown",
+        "symbol":      symbol,
+        "timeframe":   tf,
+        "price":       price,
+        "change24":    change24,
+        "quote_vol":   float(ticker["quoteVolume"]),
+        "recent_move": round(recent_dump * 100, 2),
+        "rsi6":        round(ind["r6"], 2),
+        "rsi12":       round(ind["r12"], 2),
+        "rsi24":       round(ind["r24"], 2),
+        "ema7":        round(ind["e7"], 8),
+        "ema25":       round(ind["e25"], 8),
+        "ema99":       round(ind["e99"], 8),
+        "macd_hist":   round(ind["mh"], 8),
+        "vol_mult":    round(vol_mult, 2),
+        "stop_price":  round(stop_price, 8),
+        "stop_pct":    round(stop_pct, 2),
+        **_change_windows(df, tf, price, change24),
     }
 
 
@@ -1021,9 +1227,37 @@ def format_breakout_alert(s: dict) -> str:
     )
 
 
+def format_breakdown_alert(s: dict) -> str:
+    ts    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    vol_m = s["quote_vol"] / 1_000_000
+    return (
+        f"🔻 <b>BREAKDOWN SHORT — {s['symbol']}</b>  [{s['timeframe']}]  mode:{MODE}\n"
+        f"{ts}\n"
+        f"\n"
+        f"Price:       <b>{s['price']}</b>\n"
+        f"24h Change:  {s['change24']:+.2f}%   |  24h Vol: ${vol_m:.1f}M\n"
+        f"Since 00:00 UTC: {s['change_utc']:+.2f}%   |  2h: {s['change_2h']:+.2f}%\n"
+        f"Recent dump: -{s['recent_move']}%  (last 10 candles on {s['timeframe']})\n"
+        f"\n"
+        f"RSI(6):  <b>{s['rsi6']}</b>  |  RSI(12): {s['rsi12']}  |  RSI(24): {s['rsi24']}\n"
+        f"EMA7:    {s['ema7']}\n"
+        f"EMA25:   {s['ema25']}  ← stop trigger\n"
+        f"EMA99:   {s['ema99']}\n"
+        f"MACD:    {s['macd_hist']}\n"
+        f"Volume:  {s['vol_mult']}×  20-candle average\n"
+        f"\n"
+        f"🛑 Stop suggestion: above {s['stop_price']}  (+{s['stop_pct']:.2f}% from entry)\n"
+        f"\n"
+        f"⚠️ Downtrend breaking lower: below EMA25, falling RSI, volume conviction\n"
+        f"Consider SHORT entry (breakdown — trend continuation, not pump fade)"
+    )
+
+
 def format_alert(s: dict) -> str:
     if s["direction"] == "breakout":
         return format_breakout_alert(s)
+    if s["direction"] == "breakdown":
+        return format_breakdown_alert(s)
     if s["direction"] == "long":
         return format_long_alert(s)
     return format_short_alert(s)
@@ -1035,9 +1269,15 @@ def run_scan(tickers: list[dict]) -> int:
     now = time.time()
     _process_pending_checkups(tickers, now)
 
-    short_candidates:    list[dict] = []
-    long_candidates:     list[dict] = []
-    breakout_candidates: list[dict] = []
+    short_candidates:     list[dict] = []
+    long_candidates:      list[dict] = []
+    breakout_candidates:  list[dict] = []
+    breakdown_candidates: list[dict] = []
+
+    # Market-regime accumulators over the liquid universe (see _regime below).
+    regime_abs_sum = 0.0
+    regime_up      = 0
+    regime_n       = 0
 
     for t in tickers:
         try:
@@ -1050,17 +1290,38 @@ def run_scan(tickers: list[dict]) -> int:
                 continue
             if high24 <= 0 or low24 <= 0:
                 continue
-            # Build all three candidate sets every scan regardless of mode, so the
-            # tracker can shadow-measure directions that aren't being alerted.
+            # Regime breadth/volatility over the liquid universe.
+            regime_abs_sum += abs(change24)
+            regime_up      += 1 if change24 > 0 else 0
+            regime_n       += 1
+            # Build all candidate sets every scan regardless of mode, so the tracker
+            # can shadow-measure directions that aren't being alerted.
             if (high24 - price) / high24 <= MAX_DIST_FROM_HIGH:
                 short_candidates.append(t)
             if change24 > -(KNIFE_MAX_DROP * 100) and (price - low24) / low24 <= MAX_DIST_FROM_LOW:
                 long_candidates.append(t)
             if BREAKOUT_MIN_DAILY <= change24 <= BREAKOUT_MAX_DAILY:
                 breakout_candidates.append(t)
+            if -BREAKDOWN_DROP_MAX <= change24 <= -BREAKDOWN_DROP_MIN:
+                breakdown_candidates.append(t)
         except Exception:
             pass
 
+    # Publish the regime for this scan BEFORE scanning candidates, so the send-gate
+    # and track_alert() snapshot both read a fresh value.
+    avg_abs = regime_abs_sum / regime_n if regime_n else 0.0
+    _regime.update({
+        "avg_abs": avg_abs,
+        "breadth": (regime_up / regime_n * 100) if regime_n else 0.0,
+        "n":       regime_n,
+        "quiet":   avg_abs < REGIME_QUIET_AVG_ABS,
+    })
+
+    log.info(
+        "Market   regime: avg |24h move| %.2f%%  breadth %.0f%% up  (%d liquid)%s",
+        _regime["avg_abs"], _regime["breadth"], _regime["n"],
+        "  — QUIET, sends suppressed" if (_regime["quiet"] and REGIME_SUPPRESS_ON_QUIET) else "",
+    )
     log.info(
         "Short    pre-filter: %d/%d coins have >$%.1fM vol and are within %d%% of 24h high",
         len(short_candidates), len(tickers),
@@ -1075,6 +1336,11 @@ def run_scan(tickers: list[dict]) -> int:
         "Breakout pre-filter: %d/%d coins up %.0f–%.0f%% on day",
         len(breakout_candidates), len(tickers),
         BREAKOUT_MIN_DAILY, BREAKOUT_MAX_DAILY,
+    )
+    log.info(
+        "Breakdown pre-filter: %d/%d coins down %.0f–%.0f%% on day",
+        len(breakdown_candidates), len(tickers),
+        BREAKDOWN_DROP_MIN, BREAKDOWN_DROP_MAX,
     )
 
     signals = 0   # alerts actually sent
@@ -1095,15 +1361,23 @@ def run_scan(tickers: list[dict]) -> int:
                     sig = check_fn(df, ticker, symbol, tf)
                     if sig:
                         # Send only if this direction is alerting in the current
-                        # mode AND the timeframe is an alert timeframe. Everything
-                        # else is shadow-measured (tracked but silent).
-                        alerted = enabled and tf in ALERT_TIMEFRAMES
+                        # mode AND the timeframe is an alert timeframe AND the market
+                        # isn't dead-quiet. Everything else is shadow-measured
+                        # (tracked but silent).
+                        alerted = (enabled and tf in ALERT_TIMEFRAMES
+                                   and not (REGIME_SUPPRESS_ON_QUIET and _regime["quiet"]))
                         tag = "" if alerted else "  (shadow)"
                         if direction == "short":
                             log.info(
                                 "SHORT  %-15s [%3s]  RSI6=%-5.1f  pump=+%.1f%%  %.2f%% from high  wick=%.0f%%%s",
                                 symbol, tf, sig["rsi6"], sig["recent_move"],
                                 sig["dist_pct"], sig["wick_ratio"], tag,
+                            )
+                        elif direction == "breakdown":
+                            log.info(
+                                "BREAKDN %-15s [%3s]  RSI6=%-5.1f  dump=-%.1f%%  day=%+.1f%%  vol=%.1fx  stop=+%.1f%%%s",
+                                symbol, tf, sig["rsi6"], sig["recent_move"],
+                                sig["change_utc"], sig["vol_mult"], sig["stop_pct"], tag,
                             )
                         elif direction == "long":
                             log.info(
@@ -1127,9 +1401,10 @@ def run_scan(tickers: list[dict]) -> int:
                     log.debug("Error %s %s: %s", symbol, tf, e)
                 time.sleep(0.1)  # gentle rate limiting
 
-    _scan_candidates(short_candidates,    check_short_signal,    "short",    SHORTS_ENABLED)
-    _scan_candidates(long_candidates,     check_long_signal,     "long",     LONGS_ENABLED)
-    _scan_candidates(breakout_candidates, check_breakout_signal, "breakout", BREAKOUTS_ENABLED)
+    _scan_candidates(short_candidates,     check_short_signal,     "short",     SHORTS_ENABLED)
+    _scan_candidates(breakdown_candidates, check_breakdown_signal, "breakdown", BREAKDOWNS_ENABLED)
+    _scan_candidates(long_candidates,      check_long_signal,      "long",      LONGS_ENABLED)
+    _scan_candidates(breakout_candidates,  check_breakout_signal,  "breakout",  BREAKOUTS_ENABLED)
 
     log.info("Scan complete — %d alert(s) sent, %d signal(s) measured", signals, tracked)
     return signals
@@ -1142,14 +1417,22 @@ def main() -> None:
     log.info("=" * 60)
     log.info("Binance Perp Futures Short & Long Scanner")
     log.info("Timeframes : measure %s  |  alert %s", TIMEFRAMES, ALERT_TIMEFRAMES)
-    log.info("Mode       : %s  (alerting shorts=%s, longs=%s, breakouts=%s)",
-             MODE, SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED)
+    log.info("Mode       : %s  (alerting shorts=%s, breakdowns=%s, longs=%s, breakouts=%s)",
+             MODE, SHORTS_ENABLED, BREAKDOWNS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED)
     log.info("Shadow-log : all strategies measured on every timeframe regardless of mode")
+    log.info("Regime     : quiet if avg |24h move| < %.1f%%  (suppress sends=%s)",
+             REGIME_QUIET_AVG_ABS, REGIME_SUPPRESS_ON_QUIET)
     log.info("Filter     : 24h vol > $%.1fM", MIN_24H_QUOTE_VOL / 1_000_000)
     if SHORTS_ENABLED:
         log.info("Short      : within %d%% of 24h high  RSI(6)>=%d  MACD-dec=%s  RSI-dec=%s  wick>=%.0f%%",
                  int(MAX_DIST_FROM_HIGH * 100), RSI6_MIN,
                  REQUIRE_MACD_DECLINING, REQUIRE_RSI_DECLINING, MIN_UPPER_WICK_RATIO * 100)
+    if BREAKDOWNS_ENABLED:
+        log.info("Breakdown  : 24h change −%.0f to −%.0f%%  RSI(6) %d–%d falling  MACD-fall=%s  full-stack=%s  vol>=%.1fx  max-stop=%.1f%%",
+                 BREAKDOWN_DROP_MIN, BREAKDOWN_DROP_MAX,
+                 BREAKDOWN_RSI_MIN, BREAKDOWN_RSI_MAX,
+                 REQUIRE_BREAKDOWN_MACD_FALLING, REQUIRE_BREAKDOWN_FULL_STACK,
+                 MIN_VOL_MULTIPLIER, MAX_BREAKDOWN_STOP_PCT)
     if LONGS_ENABLED:
         log.info("Long       : within %d%% of 24h low   RSI(6)<=%d  MACD-rise=%s  RSI-rise=%s  wick>=%.0f%%  vol>=%.1fx  knife<=%d%%",
                  int(MAX_DIST_FROM_LOW * 100), RSI6_MAX,
@@ -1184,9 +1467,11 @@ def main() -> None:
         now = time.time()
         if now - _last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            quiet_tag = "  ⚠️ QUIET" if (_regime["quiet"] and REGIME_SUPPRESS_ON_QUIET) else ""
             send_telegram(
                 f"🟢 <b>Scanner alive</b> — [{ts}]\n"
                 f"Mode:               <b>{MODE}</b>\n"
+                f"Market:             avg |24h| {_regime['avg_abs']:.1f}%  ·  {_regime['breadth']:.0f}% up{quiet_tag}\n"
                 f"Scans this session: {_total_scans}\n"
                 f"Alerts sent:        {_total_alerts}\n"
                 f"Next scan in {SCAN_INTERVAL_SEC}s"
