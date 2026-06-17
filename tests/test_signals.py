@@ -176,10 +176,25 @@ def _liquid_tickers(changes):
     } for i, c in enumerate(changes)]
 
 
-def test_regime_quiet_classification(monkeypatch=None):
+def test_fade_daily_floor_gate():
+    # The fade-short floor rejects early when the coin isn't up enough on the day.
+    df = _downtrend()  # any frame; the floor check runs before the other gates
+    price = float(df["close"].iloc[-2])
+    ticker = {"priceChangePercent": "10.0", "quoteVolume": "50000000",
+              "highPrice": str(price * 1.01), "lowPrice": "1", "lastPrice": str(price)}
+    _orig = scanner.FADE_MIN_DAILY_CHANGE
+    try:
+        scanner.FADE_MIN_DAILY_CHANGE = 20.0  # require >=20% up; ticker is only +10%
+        assert scanner.check_short_signal(df, ticker, "T", "1h") is None
+    finally:
+        scanner.FADE_MIN_DAILY_CHANGE = _orig
+
+
+def test_regime_quiet_classification():
     # Stub klines so any candidate scan returns immediately (len<50 → skip), no net.
+    _orig_klines = scanner.fetch_klines
+    _orig_sleep  = scanner.time.sleep
     scanner.fetch_klines = lambda *a, **k: pd.DataFrame({"close": [1.0] * 5})
-    _orig_sleep = scanner.time.sleep
     scanner.time.sleep = lambda *a, **k: None
     try:
         scanner.apply_mode("both")
@@ -191,6 +206,7 @@ def test_regime_quiet_classification(monkeypatch=None):
         scanner.run_scan(_liquid_tickers([6, -9, 12, -3, 7.2, -10.8, 5.4, -6.6, 8.4, -4.2]))
         assert scanner._regime["quiet"] is False
     finally:
+        scanner.fetch_klines = _orig_klines
         scanner.time.sleep = _orig_sleep
         scanner.apply_mode(scanner.DEFAULT_MODE)
 

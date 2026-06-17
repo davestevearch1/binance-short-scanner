@@ -89,10 +89,11 @@ BREAKDOWN_RSI_MIN         = 15    # Breakdown: RSI(6) must stay > 15 (not yet ca
 MAX_BREAKDOWN_STOP_PCT    = 5.0   # Breakdown: skip if stop above EMA25 would be >5% wide (bad R:R)
 
 # ── Daily-% windows recorded on every signal (computed from klines already fetched) ──
-# These are *measured and recorded* on every trade so future tuning is evidence-based.
-# FADE_MIN_DAILY_CHANGE stays None (off) for now per the hybrid decision — set it to a
-# positive number to require fade-shorts be up >= that % on the day before alerting.
-FADE_MIN_DAILY_CHANGE = None    # recorded-only; e.g. 20.0 → only fade-short coins up >=20%/day
+# change_2h / change_utc / blowoff are *measured and recorded* on every trade so future
+# tuning is evidence-based. FADE_MIN_DAILY_CHANGE is an optional hard floor on the fade
+# short: None disables it (default); set a positive number to require the coin be up at
+# least that much on the day before a fade-short can alert.
+FADE_MIN_DAILY_CHANGE = None    # None = off; e.g. 20.0 → only fade-short coins up >=20%/day
 BLOWOFF_PCT           = 100.0   # tag coins up >=100% on the day as blow-off tops
 
 # ── Market regime (computed each scan from the full ticker list) ──────────────────
@@ -829,8 +830,14 @@ def check_short_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> 
     """
     ind    = compute_indicators(df)
     c      = df["close"]
-    price  = ind["price"]
-    high24 = float(ticker["highPrice"])
+    price    = ind["price"]
+    high24   = float(ticker["highPrice"])
+    change24 = float(ticker["priceChangePercent"])
+
+    # Optional daily-pump floor — only fade coins already up >= the floor on the day.
+    # Off by default (FADE_MIN_DAILY_CHANGE is None); recorded-only until tuned on data.
+    if FADE_MIN_DAILY_CHANGE is not None and change24 < FADE_MIN_DAILY_CHANGE:
+        return None
 
     if ind["r6"] < RSI6_MIN:
         return None
@@ -868,7 +875,7 @@ def check_short_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> 
         "timeframe":   tf,
         "price":       price,
         "high24":      high24,
-        "change24":    float(ticker["priceChangePercent"]),
+        "change24":    change24,
         "quote_vol":   float(ticker["quoteVolume"]),
         "dist_pct":    round(dist_pct * 100, 2),
         "recent_move": round(recent_pump * 100, 2),
@@ -882,7 +889,7 @@ def check_short_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> 
         "wick_ratio":  round(wick_ratio * 100, 1),
         "stop_price":  round(stop_price, 8),
         "stop_pct":    round(stop_pct, 2),
-        **_change_windows(df, tf, price, float(ticker["priceChangePercent"])),
+        **_change_windows(df, tf, price, change24),
     }
 
 
