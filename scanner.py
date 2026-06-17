@@ -11,12 +11,15 @@ Three setup types in one scanner:
 Each alert includes a stop suggestion based on the trigger level
 (24h high for shorts, 24h low for bounces, EMA25 for breakouts).
 
-Modes (admin-switchable from Telegram):
-  /v1      — shorts only, loose conditions
-  /v2      — shorts only, strict  (default)
-  /long    — bounce-longs + breakouts (longs only), strict
-  /v1Both  — shorts + bounce-longs + breakouts, loose
-  /v2Both  — shorts + bounce-longs + breakouts, strict
+Modes (admin-switchable from Telegram) control which alerts are *sent*; every
+strategy is shadow-measured on every timeframe regardless, so /stats has data on
+all of them even when they aren't being alerted:
+  /short — send shorts only
+  /long  — send bounce-longs + breakouts  (default)
+  /both  — send shorts + bounce-longs + breakouts
+
+Timeframes: signals are evaluated and measured on all of TIMEFRAMES (15m + 1h),
+but only ALERT_TIMEFRAMES (1h) are sent to Telegram.
 
 Setup: copy .env.example to .env and fill in your Telegram credentials.
 Run:   python scanner.py
@@ -48,8 +51,12 @@ TELEGRAM_BROADCAST_IDS = [
 # ── Binance Futures base URL ──────────────────────────────────────────────────
 FUTURES_BASE = "https://fapi.binance.com"
 
-# ── Timeframes to scan ────────────────────────────────────────────────────────
-TIMEFRAMES = ["15m", "1h"]
+# ── Timeframes ────────────────────────────────────────────────────────────────
+# We *evaluate and measure* every signal on all of TIMEFRAMES (shadow-logging),
+# but only *send* Telegram alerts for the timeframes in ALERT_TIMEFRAMES. This
+# keeps validating the "1h beats 15m" finding without the 15m alert spam.
+TIMEFRAMES       = ["15m", "1h"]
+ALERT_TIMEFRAMES = ["1h"]
 
 # ── Filters fixed across all modes ───────────────────────────────────────────
 MIN_24H_QUOTE_VOL  = 5_000_000  # Only scan coins with >$5M USDT 24h volume
@@ -73,100 +80,82 @@ BREAKOUT_RSI_MAX         = 85    # Breakout: RSI(6) must be < 85 (rising RSI sep
 MAX_BREAKOUT_STOP_PCT    = 5.0   # Breakout: skip if stop would be >5% wide (bad R:R)
 
 # ── Mode preset (live-switchable via Telegram) ────────────────────────────────
-# Restart reverts to DEFAULT_MODE.
-DEFAULT_MODE = "v2"
-VALID_MODES  = ("v1", "v2", "long", "v1both", "v2both")  # matched lowercased
+# Three modes, all using the strict (v2) strategy rules. A mode only controls
+# which directions are *sent* as Telegram alerts — shadow-logging measures every
+# direction on every timeframe regardless (see run_scan). Restart reverts to
+# DEFAULT_MODE.
+DEFAULT_MODE = "long"
+VALID_MODES  = ("short", "long", "both")  # matched lowercased
+# Hidden aliases so the admin's old commands still work.
+_MODE_ALIASES = {"v2": "short", "v2both": "both"}
 
 # These globals are set by apply_mode() at startup and on each Telegram command.
 MODE:                   str
-SHORTS_ENABLED:         bool
+SHORTS_ENABLED:         bool   # "enabled" now means "alerts are sent for this direction"
 LONGS_ENABLED:          bool
 BREAKOUTS_ENABLED:      bool
-# Short-side thresholds
+# Short-side thresholds (strict v2)
 RSI6_MIN:               int
 REQUIRE_MACD_DECLINING: bool
 REQUIRE_RSI_DECLINING:  bool
 MIN_UPPER_WICK_RATIO:   float
-# Long-side thresholds
+# Long-side thresholds (strict v2)
 RSI6_MAX:               int
 REQUIRE_MACD_RISING:    bool
 REQUIRE_RSI_RISING:     bool
 MIN_LOWER_WICK_RATIO:   float
-# Breakout-side thresholds (mode-controlled v1/v2 toggles)
+# Breakout-side thresholds (strict v2)
 BREAKOUT_RSI_MIN:               int
 REQUIRE_BREAKOUT_FULL_STACK:    bool
 REQUIRE_BREAKOUT_MACD_RISING:   bool
 
-# Canonical display names (preserves v1Both / v2Both capitalisation)
+# Canonical display names.
 _MODE_DISPLAY = {
-    "v1":     "v1",
-    "v2":     "v2",
-    "long":   "long",
-    "v1both": "v1Both",
-    "v2both": "v2Both",
+    "short": "short",
+    "long":  "long",
+    "both":  "both",
 }
 
 
-def _apply_short_strategy(name: str) -> None:
+def _apply_short_strategy() -> None:
     global RSI6_MIN, REQUIRE_MACD_DECLINING, REQUIRE_RSI_DECLINING, MIN_UPPER_WICK_RATIO
-    if name == "v1":
-        RSI6_MIN, REQUIRE_MACD_DECLINING, REQUIRE_RSI_DECLINING, MIN_UPPER_WICK_RATIO = \
-            65, False, False, 0.0
-    else:  # v2
-        RSI6_MIN, REQUIRE_MACD_DECLINING, REQUIRE_RSI_DECLINING, MIN_UPPER_WICK_RATIO = \
-            70, True, True, 0.35
+    RSI6_MIN, REQUIRE_MACD_DECLINING, REQUIRE_RSI_DECLINING, MIN_UPPER_WICK_RATIO = \
+        70, True, True, 0.35
 
 
-def _apply_long_strategy(name: str) -> None:
+def _apply_long_strategy() -> None:
     global RSI6_MAX, REQUIRE_MACD_RISING, REQUIRE_RSI_RISING, MIN_LOWER_WICK_RATIO
-    if name == "v1":
-        RSI6_MAX, REQUIRE_MACD_RISING, REQUIRE_RSI_RISING, MIN_LOWER_WICK_RATIO = \
-            30, False, False, 0.0
-    else:  # v2
-        RSI6_MAX, REQUIRE_MACD_RISING, REQUIRE_RSI_RISING, MIN_LOWER_WICK_RATIO = \
-            25, True, True, 0.35
+    RSI6_MAX, REQUIRE_MACD_RISING, REQUIRE_RSI_RISING, MIN_LOWER_WICK_RATIO = \
+        25, True, True, 0.35
 
 
-def _apply_breakout_strategy(name: str) -> None:
+def _apply_breakout_strategy() -> None:
     global BREAKOUT_RSI_MIN, REQUIRE_BREAKOUT_FULL_STACK, REQUIRE_BREAKOUT_MACD_RISING
-    if name == "v1":
-        BREAKOUT_RSI_MIN, REQUIRE_BREAKOUT_FULL_STACK, REQUIRE_BREAKOUT_MACD_RISING = \
-            50, False, False
-    else:  # v2
-        BREAKOUT_RSI_MIN, REQUIRE_BREAKOUT_FULL_STACK, REQUIRE_BREAKOUT_MACD_RISING = \
-            60, True, True
+    BREAKOUT_RSI_MIN, REQUIRE_BREAKOUT_FULL_STACK, REQUIRE_BREAKOUT_MACD_RISING = \
+        60, True, True
 
 
 def apply_mode(mode: str) -> bool:
     """
     Switch scanner mode. Case-insensitive. Returns True if applied, False if unknown.
-    Mapping:
-      v1     → shorts v1, longs off,   breakouts off
-      v2     → shorts v2, longs off,   breakouts off
-      long   → shorts off, longs v2,   breakouts v2
-      v1both → shorts v1, longs v1,    breakouts v1
-      v2both → shorts v2, longs v2,    breakouts v2
+    A mode only controls which directions are *sent* as alerts; all strategies use
+    the strict (v2) rules and are measured on every timeframe regardless.
+      short → send shorts only
+      long  → send bounce-longs + breakouts
+      both  → send all three
     """
     global MODE, SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED
     key = mode.strip().lower()
+    key = _MODE_ALIASES.get(key, key)
     if key not in VALID_MODES:
         return False
     MODE = _MODE_DISPLAY[key]
-    if key == "v1":
-        SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED = True,  False, False
-        _apply_short_strategy("v1");  _apply_long_strategy("v2");  _apply_breakout_strategy("v2")
-    elif key == "v2":
-        SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED = True,  False, False
-        _apply_short_strategy("v2");  _apply_long_strategy("v2");  _apply_breakout_strategy("v2")
-    elif key == "long":
-        SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED = False, True,  True
-        _apply_short_strategy("v2");  _apply_long_strategy("v2");  _apply_breakout_strategy("v2")
-    elif key == "v1both":
-        SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED = True,  True,  True
-        _apply_short_strategy("v1");  _apply_long_strategy("v1");  _apply_breakout_strategy("v1")
-    elif key == "v2both":
-        SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED = True,  True,  True
-        _apply_short_strategy("v2");  _apply_long_strategy("v2");  _apply_breakout_strategy("v2")
+    SHORTS_ENABLED    = key in ("short", "both")
+    LONGS_ENABLED     = key in ("long",  "both")
+    BREAKOUTS_ENABLED = key in ("long",  "both")
+    _apply_short_strategy()
+    _apply_long_strategy()
+    _apply_breakout_strategy()
     return True
 
 
@@ -201,7 +190,9 @@ _telegram_update_offset = 0
 COMMAND_POLL_INTERVAL_SEC = 5
 
 # ── Performance tracker ───────────────────────────────────────────────────────
-STATE_FILE            = "state.json"
+# Override STATE_FILE to a mounted path (e.g. /app/data/state.json) so the trade
+# history survives container restarts/redeploys.
+STATE_FILE            = os.getenv("STATE_FILE", "state.json").strip() or "state.json"
 TRACKER_CHECKUP_1_SEC = 1800   # +30 minutes
 TRACKER_CHECKUP_2_SEC = 7200   # +2 hours (final)
 RESULTS_MAX_DAYS      = 30     # keep results for 30 days then purge
@@ -227,28 +218,48 @@ def load_state() -> None:
 def save_state() -> None:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=RESULTS_MAX_DAYS)).isoformat()
     fresh  = [r for r in _results if r.get("ts", "") >= cutoff]
+    path = Path(STATE_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)  # ensure mounted data dir exists
     tmp = Path(STATE_FILE + ".tmp")
     tmp.write_text(json.dumps({"tracked": _tracked, "results": fresh}, indent=2))
-    tmp.replace(Path(STATE_FILE))
+    tmp.replace(path)
 
 
-def _current_variant() -> str:
-    return "v1" if MODE.lower() in ("v1", "v1both") else "v2"
+# Indicator fields copied from the signal onto every tracked trade so a future
+# review can correlate entry features with outcomes (all already computed in `sig`).
+_SNAPSHOT_KEYS = (
+    "rsi6", "rsi12", "rsi24", "ema7", "ema25", "ema99", "macd_hist",
+    "vol_mult", "change24", "wick_ratio", "dist_pct", "recent_move", "stop_pct",
+)
 
 
-def track_alert(sig: dict) -> None:
+def _signal_snapshot(sig: dict) -> dict:
+    return {k: sig.get(k) for k in _SNAPSHOT_KEYS}
+
+
+def track_alert(sig: dict, alerted: bool) -> None:
+    """Record a signal for +2h outcome measurement.
+
+    `alerted` is True only when the signal was actually sent to Telegram (its
+    direction is enabled in the current mode and its timeframe is in
+    ALERT_TIMEFRAMES). Shadow trades (alerted=False) are measured but never send
+    alerts or follow-up messages.
+    """
     entry = sig["price"]
     _tracked.append({
         "symbol":       sig["symbol"],
         "timeframe":    sig["timeframe"],
         "direction":    sig["direction"],
-        "variant":      _current_variant(),
+        "variant":      "v2",
         "mode":         MODE,
+        "alerted":      alerted,
         "entry":        entry,
         "stop":         sig["stop_price"],
         "ts":           time.time(),
-        "extreme_seen": entry,
+        "extreme_seen": entry,   # worst adverse price (drives stop + MAE)
+        "favor_seen":   entry,   # best favorable price (drives MFE)
         "checks_done":  0,
+        "snapshot":     _signal_snapshot(sig),
     })
     save_state()
 
@@ -288,37 +299,55 @@ def _process_pending_checkups(tickers: list[dict], now: float) -> None:
         if price is None:
             continue
         direction = item["direction"]
+        entry     = item["entry"]
         if direction == "short":
-            item["extreme_seen"] = max(item["extreme_seen"], price)
+            item["extreme_seen"] = max(item["extreme_seen"], price)          # adverse (highest)
+            item["favor_seen"]   = min(item.get("favor_seen", entry), price)  # favorable (lowest)
         else:
-            item["extreme_seen"] = min(item["extreme_seen"], price)
+            item["extreme_seen"] = min(item["extreme_seen"], price)          # adverse (lowest)
+            item["favor_seen"]   = max(item.get("favor_seen", entry), price)  # favorable (highest)
         changed  = True
         stop     = item["stop"]
+        alerted  = item.get("alerted", True)  # old records (pre-shadow) were all real alerts
         stop_hit = (direction == "short" and item["extreme_seen"] > stop) or \
                    (direction != "short" and item["extreme_seen"] < stop)
         elapsed  = now - item["ts"]
         if item["checks_done"] == 0 and elapsed >= TRACKER_CHECKUP_1_SEC:
-            send_telegram(format_checkup_message(item, price, stop_hit, final=False))
+            if alerted:
+                send_telegram(format_checkup_message(item, price, stop_hit, final=False))
             item["checks_done"] = 1
         elif item["checks_done"] == 1 and elapsed >= TRACKER_CHECKUP_2_SEC:
-            send_telegram(format_checkup_message(item, price, stop_hit, final=True))
-            entry   = item["entry"]
+            if alerted:
+                send_telegram(format_checkup_message(item, price, stop_hit, final=True))
             pct     = (price - entry) / entry * 100
             if direction == "short":
                 pct = -pct  # positive means price fell (good for shorts)
             outcome = "loss" if stop_hit else ("win" if pct > 0 else "loss")
-            _results.append({
+            favor   = item.get("favor_seen", entry)
+            adverse = item.get("extreme_seen", entry)
+            if direction == "short":
+                mfe = (entry - favor) / entry * 100
+                mae = (adverse - entry) / entry * 100
+            else:
+                mfe = (favor - entry) / entry * 100
+                mae = (entry - adverse) / entry * 100
+            result = {
                 "symbol":    sym,
                 "direction": direction,
                 "variant":   item.get("variant", "v2"),
                 "timeframe": item["timeframe"],
                 "mode":      item.get("mode", MODE),
+                "alerted":   alerted,
                 "entry":     entry,
                 "stop":      stop,
                 "outcome":   outcome,
                 "final_pct": round(pct, 2),
+                "mfe":       round(mfe, 2),
+                "mae":       round(mae, 2),
                 "ts":        datetime.fromtimestamp(item["ts"], tz=timezone.utc).isoformat(),
-            })
+            }
+            result.update(item.get("snapshot", {}))
+            _results.append(result)
             finished.append(item)
     for item in finished:
         _tracked.remove(item)
@@ -331,8 +360,12 @@ def format_stats() -> str:
         return "📈 No completed trade outcomes yet.\nCheck back after alerts have had 2 hours to play out."
     grouped: dict[tuple, list[dict]] = defaultdict(list)
     for r in _results:
-        grouped[(r["direction"], r.get("variant", "v2"))].append(r)
-    lines = [f"📈 <b>Scanner stats</b> ({len(_results)} completed, last {RESULTS_MAX_DAYS}d)\n"]
+        grouped[(r["direction"], r.get("timeframe", "?"))].append(r)
+    n_alerted = sum(1 for r in _results if r.get("alerted", True))
+    lines = [
+        f"📈 <b>Scanner stats</b> ({len(_results)} completed, last {RESULTS_MAX_DAYS}d)",
+        f"   {n_alerted} sent · {len(_results) - n_alerted} shadow-measured\n",
+    ]
     for direction, emoji, label in [
         ("short",    "🔴", "Shorts"),
         ("long",     "🟢", "Bounces"),
@@ -342,17 +375,20 @@ def format_stats() -> str:
         if not dir_items:
             continue
         lines.append(f"\n{emoji} <b>{label}</b>")
-        for variant in ("v1", "v2"):
-            items = grouped.get((direction, variant), [])
+        for tf in TIMEFRAMES:
+            items = grouped.get((direction, tf), [])
             if not items:
                 continue
             wins    = sum(1 for r in items if r["outcome"] == "win")
             losses  = len(items) - wins
             pct_win = wins / len(items) * 100
             avg_pct = sum(r["final_pct"] for r in items) / len(items)
-            lines.append(
-                f"  {variant}: {wins}W / {losses}L = {pct_win:.0f}%   avg {avg_pct:+.1f}% at 2h"
-            )
+            line    = f"  {tf}: {wins}W / {losses}L = {pct_win:.0f}%   avg {avg_pct:+.1f}% at 2h"
+            mfes = [r["mfe"] for r in items if r.get("mfe") is not None]
+            maes = [r["mae"] for r in items if r.get("mae") is not None]
+            if mfes and maes:
+                line += f"   MFE +{sum(mfes)/len(mfes):.1f}% / MAE −{sum(maes)/len(maes):.1f}%"
+            lines.append(line)
     return "\n".join(lines)
 
 
@@ -428,21 +464,21 @@ def format_status() -> str:
         f"  RSI(6) ≥ {RSI6_MIN}{', declining' if REQUIRE_RSI_DECLINING else ''}\n"
         f"  MACD positive{', declining' if REQUIRE_MACD_DECLINING else ''}\n"
         f"  Upper wick ≥ {int(MIN_UPPER_WICK_RATIO * 100)}%"
-    ) if SHORTS_ENABLED else "  (off)"
+    ) if SHORTS_ENABLED else "  (shadow only — measured, not alerting)"
 
     long_info = (
         f"  RSI(6) ≤ {RSI6_MAX}{', rising' if REQUIRE_RSI_RISING else ''}\n"
         f"  MACD negative{', rising' if REQUIRE_MACD_RISING else ''}\n"
         f"  Lower wick ≥ {int(MIN_LOWER_WICK_RATIO * 100)}%\n"
         f"  Vol ≥ {MIN_VOL_MULTIPLIER}×  |  knife filter: −{int(KNIFE_MAX_DROP*100)}%"
-    ) if LONGS_ENABLED else "  (off)"
+    ) if LONGS_ENABLED else "  (shadow only — measured, not alerting)"
 
     breakout_info = (
         f"  Price > EMA25  |  EMA7 > EMA25{' > EMA99' if REQUIRE_BREAKOUT_FULL_STACK else ''}\n"
         f"  RSI(6) {BREAKOUT_RSI_MIN}–{BREAKOUT_RSI_MAX}, rising\n"
         f"  MACD > 0{', rising' if REQUIRE_BREAKOUT_MACD_RISING else ''}\n"
         f"  Vol ≥ {MIN_VOL_MULTIPLIER}×  |  24h change {BREAKOUT_MIN_DAILY:.0f}–{BREAKOUT_MAX_DAILY:.0f}%"
-    ) if BREAKOUTS_ENABLED else "  (off)"
+    ) if BREAKOUTS_ENABLED else "  (shadow only — measured, not alerting)"
 
     return (
         f"🟢 <b>Scanner status</b>\n"
@@ -462,19 +498,18 @@ def format_help(is_admin: bool) -> str:
     public = (
         "<b>Commands</b>\n"
         "/status — show current scanner state\n"
-        "/stats  — win/loss breakdown per strategy (v1 vs v2)\n"
+        "/stats  — win/loss breakdown per strategy & timeframe\n"
         "/help   — show this message"
     )
     if not is_admin:
         return public
     return (
         public + "\n\n"
-        "<b>Admin — mode commands</b>\n"
-        "/v1     — shorts only, loose conditions\n"
-        "/v2     — shorts only, strict  (default)\n"
-        "/long   — bounce-longs + breakouts (longs only), strict\n"
-        "/v1Both — shorts + bounce-longs + breakouts, loose\n"
-        "/v2Both — shorts + bounce-longs + breakouts, strict\n"
+        "<b>Admin — mode commands</b>  (controls which alerts are sent;\n"
+        "all strategies are measured on every timeframe regardless)\n"
+        "/short — send shorts only\n"
+        "/long  — send bounce-longs + breakouts  (default)\n"
+        "/both  — send shorts + bounce-longs + breakouts\n"
         "\n"
         "<b>Admin — controls</b>\n"
         "/pause  — stop scanning (alerts off)\n"
@@ -495,15 +530,16 @@ def handle_command(text: str, from_id: int, chat_id: int) -> None:
     cmd_root = cmd[1:].split("@", 1)[0]
     is_admin = str(from_id) == str(TELEGRAM_CHAT_ID)
 
-    # Mode-switching commands (case-insensitive)
-    if cmd_root in VALID_MODES:
+    # Mode-switching commands (case-insensitive; v2/v2both are hidden aliases)
+    canonical_mode = _MODE_ALIASES.get(cmd_root, cmd_root)
+    if canonical_mode in VALID_MODES:
         if not is_admin:
             send_telegram_reply(chat_id, "⛔ Only the admin can change mode.")
             return
-        if cmd_root == MODE.lower():
+        if canonical_mode == MODE.lower():
             send_telegram_reply(chat_id, f"ℹ️ Already on <b>{MODE}</b>.")
             return
-        apply_mode(cmd_root)
+        apply_mode(canonical_mode)
         log.info("Mode switched to %s via Telegram by admin", MODE)
         send_telegram(f"⚙️ <b>Mode switched to {MODE}</b> by admin")
 
@@ -671,13 +707,13 @@ def check_short_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> 
 
     Conditions (all must pass):
       1. RSI(6) >= RSI6_MIN              — overbought
-      2. RSI(6) declining (v2)           — peak has passed
+      2. RSI(6) declining                — peak has passed
       3. Price within MAX_DIST_FROM_HIGH — at obvious resistance
       4. Recent pump >= MIN_RECENT_PUMP  — move confirmed on this TF
       5. EMA stack bullish               — overextended pump
       6. MACD histogram > 0             — momentum still present
-      7. MACD histogram declining (v2)  — momentum rolling over
-      8. Upper wick >= MIN_UPPER_WICK_RATIO (v2) — rejection candle
+      7. MACD histogram declining        — momentum rolling over
+      8. Upper wick >= MIN_UPPER_WICK_RATIO — rejection candle
     """
     ind    = compute_indicators(df)
     c      = df["close"]
@@ -749,11 +785,11 @@ def check_long_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> d
       5. 24h change not worse than KNIFE_MAX_DROP — avoid news/exploit dumps
       6. Candle volume >= MIN_VOL_MULTIPLIER × 20c avg — buyers showed up
 
-    Variable conditions (v1 loose / v2 strict):
+    Strict conditions (always required):
       7. RSI(6) <= RSI6_MAX               — oversold
-      8. RSI(6) rising (v2)               — bottom has passed
-      9. MACD histogram rising (v2)       — momentum turning
-     10. Lower wick >= MIN_LOWER_WICK_RATIO (v2) — hammer candle
+      8. RSI(6) rising                    — bottom has passed
+      9. MACD histogram rising            — momentum turning
+     10. Lower wick >= MIN_LOWER_WICK_RATIO — hammer candle
     """
     ind      = compute_indicators(df)
     c        = df["close"]
@@ -784,7 +820,7 @@ def check_long_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) -> d
     if ind["avg_vol_20"] > 0 and ind["candle_vol"] < MIN_VOL_MULTIPLIER * ind["avg_vol_20"]:
         return None
 
-    # Variable (v1/v2) conditions
+    # Strict (v2) conditions — RSI/MACD turning up + hammer wick
     if ind["r6"] > RSI6_MAX:
         return None
     if REQUIRE_RSI_RISING and ind["r6"] <= ind["r6_prev"]:
@@ -840,10 +876,10 @@ def check_breakout_signal(df: pd.DataFrame, ticker: dict, symbol: str, tf: str) 
       7. Recent pump >= BREAKOUT_MIN_RECENT_PUMP       — breakout fresh on this TF
       8. Stop distance <= MAX_BREAKOUT_STOP_PCT         — skip late/wide-stop entries
 
-    Variable conditions (v1 loose / v2 strict):
-      9. EMA stack full bullish (EMA7>EMA25>EMA99)    — required in v2
-     10. MACD histogram rising                        — required in v2
-     11. RSI(6) >= 60 (instead of just >=50)          — enforced via BREAKOUT_RSI_MIN
+    Strict conditions (always required):
+      9. EMA stack full bullish (EMA7>EMA25>EMA99)
+     10. MACD histogram rising
+     11. RSI(6) >= 60                                 — enforced via BREAKOUT_RSI_MIN
     """
     ind      = compute_indicators(df)
     c        = df["close"]
@@ -1014,39 +1050,38 @@ def run_scan(tickers: list[dict]) -> int:
                 continue
             if high24 <= 0 or low24 <= 0:
                 continue
-            if SHORTS_ENABLED and (high24 - price) / high24 <= MAX_DIST_FROM_HIGH:
+            # Build all three candidate sets every scan regardless of mode, so the
+            # tracker can shadow-measure directions that aren't being alerted.
+            if (high24 - price) / high24 <= MAX_DIST_FROM_HIGH:
                 short_candidates.append(t)
-            if LONGS_ENABLED and change24 > -(KNIFE_MAX_DROP * 100):
-                if (price - low24) / low24 <= MAX_DIST_FROM_LOW:
-                    long_candidates.append(t)
-            if BREAKOUTS_ENABLED and BREAKOUT_MIN_DAILY <= change24 <= BREAKOUT_MAX_DAILY:
+            if change24 > -(KNIFE_MAX_DROP * 100) and (price - low24) / low24 <= MAX_DIST_FROM_LOW:
+                long_candidates.append(t)
+            if BREAKOUT_MIN_DAILY <= change24 <= BREAKOUT_MAX_DAILY:
                 breakout_candidates.append(t)
         except Exception:
             pass
 
-    if SHORTS_ENABLED:
-        log.info(
-            "Short    pre-filter: %d/%d coins have >$%.1fM vol and are within %d%% of 24h high",
-            len(short_candidates), len(tickers),
-            MIN_24H_QUOTE_VOL / 1_000_000, int(MAX_DIST_FROM_HIGH * 100),
-        )
-    if LONGS_ENABLED:
-        log.info(
-            "Long     pre-filter: %d/%d coins have >$%.1fM vol and are within %d%% of 24h low (knife-filtered)",
-            len(long_candidates), len(tickers),
-            MIN_24H_QUOTE_VOL / 1_000_000, int(MAX_DIST_FROM_LOW * 100),
-        )
-    if BREAKOUTS_ENABLED:
-        log.info(
-            "Breakout pre-filter: %d/%d coins up %.0f–%.0f%% on day",
-            len(breakout_candidates), len(tickers),
-            BREAKOUT_MIN_DAILY, BREAKOUT_MAX_DAILY,
-        )
+    log.info(
+        "Short    pre-filter: %d/%d coins have >$%.1fM vol and are within %d%% of 24h high",
+        len(short_candidates), len(tickers),
+        MIN_24H_QUOTE_VOL / 1_000_000, int(MAX_DIST_FROM_HIGH * 100),
+    )
+    log.info(
+        "Long     pre-filter: %d/%d coins have >$%.1fM vol and are within %d%% of 24h low (knife-filtered)",
+        len(long_candidates), len(tickers),
+        MIN_24H_QUOTE_VOL / 1_000_000, int(MAX_DIST_FROM_LOW * 100),
+    )
+    log.info(
+        "Breakout pre-filter: %d/%d coins up %.0f–%.0f%% on day",
+        len(breakout_candidates), len(tickers),
+        BREAKOUT_MIN_DAILY, BREAKOUT_MAX_DAILY,
+    )
 
-    signals = 0
+    signals = 0   # alerts actually sent
+    tracked = 0   # signals recorded (sent + shadow)
 
-    def _scan_candidates(candidates: list[dict], check_fn, direction: str) -> None:
-        nonlocal signals
+    def _scan_candidates(candidates: list[dict], check_fn, direction: str, enabled: bool) -> None:
+        nonlocal signals, tracked
         for ticker in candidates:
             symbol = ticker["symbol"]
             for tf in TIMEFRAMES:
@@ -1059,37 +1094,44 @@ def run_scan(tickers: list[dict]) -> int:
                         continue
                     sig = check_fn(df, ticker, symbol, tf)
                     if sig:
+                        # Send only if this direction is alerting in the current
+                        # mode AND the timeframe is an alert timeframe. Everything
+                        # else is shadow-measured (tracked but silent).
+                        alerted = enabled and tf in ALERT_TIMEFRAMES
+                        tag = "" if alerted else "  (shadow)"
                         if direction == "short":
                             log.info(
-                                "SHORT  %-15s [%3s]  RSI6=%-5.1f  pump=+%.1f%%  %.2f%% from high  wick=%.0f%%",
+                                "SHORT  %-15s [%3s]  RSI6=%-5.1f  pump=+%.1f%%  %.2f%% from high  wick=%.0f%%%s",
                                 symbol, tf, sig["rsi6"], sig["recent_move"],
-                                sig["dist_pct"], sig["wick_ratio"],
+                                sig["dist_pct"], sig["wick_ratio"], tag,
                             )
                         elif direction == "long":
                             log.info(
-                                "LONG   %-15s [%3s]  RSI6=%-5.1f  dump=-%.1f%%  %.2f%% from low   wick=%.0f%%  vol=%.1fx",
+                                "LONG   %-15s [%3s]  RSI6=%-5.1f  dump=-%.1f%%  %.2f%% from low   wick=%.0f%%  vol=%.1fx%s",
                                 symbol, tf, sig["rsi6"], sig["recent_move"],
-                                sig["dist_pct"], sig["wick_ratio"], sig["vol_mult"],
+                                sig["dist_pct"], sig["wick_ratio"], sig["vol_mult"], tag,
                             )
                         else:  # breakout
                             log.info(
-                                "BREAK  %-15s [%3s]  RSI6=%-5.1f  pump=+%.1f%%  vol=%.1fx  stop=-%.1f%%",
+                                "BREAK  %-15s [%3s]  RSI6=%-5.1f  pump=+%.1f%%  vol=%.1fx  stop=-%.1f%%%s",
                                 symbol, tf, sig["rsi6"], sig["recent_move"],
-                                sig["vol_mult"], sig["stop_pct"],
+                                sig["vol_mult"], sig["stop_pct"], tag,
                             )
-                        send_telegram(format_alert(sig))
-                        track_alert(sig)
+                        if alerted:
+                            send_telegram(format_alert(sig))
+                            signals += 1
+                        track_alert(sig, alerted)
                         _alerted[key] = now
-                        signals += 1
+                        tracked += 1
                 except Exception as e:
                     log.debug("Error %s %s: %s", symbol, tf, e)
                 time.sleep(0.1)  # gentle rate limiting
 
-    _scan_candidates(short_candidates,    check_short_signal,    "short")
-    _scan_candidates(long_candidates,     check_long_signal,     "long")
-    _scan_candidates(breakout_candidates, check_breakout_signal, "breakout")
+    _scan_candidates(short_candidates,    check_short_signal,    "short",    SHORTS_ENABLED)
+    _scan_candidates(long_candidates,     check_long_signal,     "long",     LONGS_ENABLED)
+    _scan_candidates(breakout_candidates, check_breakout_signal, "breakout", BREAKOUTS_ENABLED)
 
-    log.info("Scan complete — %d alert(s) sent", signals)
+    log.info("Scan complete — %d alert(s) sent, %d signal(s) measured", signals, tracked)
     return signals
 
 
@@ -1099,9 +1141,10 @@ def main() -> None:
 
     log.info("=" * 60)
     log.info("Binance Perp Futures Short & Long Scanner")
-    log.info("Timeframes : %s", TIMEFRAMES)
-    log.info("Mode       : %s  (shorts=%s, longs=%s, breakouts=%s)",
+    log.info("Timeframes : measure %s  |  alert %s", TIMEFRAMES, ALERT_TIMEFRAMES)
+    log.info("Mode       : %s  (alerting shorts=%s, longs=%s, breakouts=%s)",
              MODE, SHORTS_ENABLED, LONGS_ENABLED, BREAKOUTS_ENABLED)
+    log.info("Shadow-log : all strategies measured on every timeframe regardless of mode")
     log.info("Filter     : 24h vol > $%.1fM", MIN_24H_QUOTE_VOL / 1_000_000)
     if SHORTS_ENABLED:
         log.info("Short      : within %d%% of 24h high  RSI(6)>=%d  MACD-dec=%s  RSI-dec=%s  wick>=%.0f%%",
